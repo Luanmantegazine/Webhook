@@ -31,7 +31,7 @@ def home():
 
 
 @app.get("/expression")
-@app.post("/review/notification")
+@app.post("/expression/notification")
 async def webhook_handler(
         request: Request,
         x_vurdere_event: Optional[str] = Header(None),
@@ -55,7 +55,7 @@ async def webhook_handler(
 
     event = x_vurdere_event.lower()
     if event == "expression_update":
-        return JSONResponse({"message": "Review recebido com sucesso!"})
+        return JSONResponse({"message": "Expression recebido com sucesso!"})
 
     logger.warning("Evento não suportado: %s", event)
     return JSONResponse(
