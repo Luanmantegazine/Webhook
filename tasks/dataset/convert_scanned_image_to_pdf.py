@@ -69,5 +69,4 @@ def convert_scanned_image_to_pdf(
         append_images=frames[1:],
         resolution=max(72, int(dpi)),
     )
-    return (str(destination),)
-
+    return str(destination)

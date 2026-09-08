@@ -61,7 +61,7 @@ def classify_document_rules(
     min_score_margin: float = 0.08,
     min_recognized_characters: int = 20,
     classification_mode: str = "observe",
-) -> tuple:
+) -> dict:
     started = perf_counter()
     result = classify_with_rules(
         classification_features,
@@ -71,5 +71,4 @@ def classify_document_rules(
         mode=classification_mode,
     )
     result["execution_time_ms"] = round((perf_counter() - started) * 1000.0, 4)
-    return (result,)
-
+    return result
