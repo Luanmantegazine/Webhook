@@ -39,6 +39,9 @@ def extract_document_classification_features(
     document: dict,
     page_sizes: list | None = None,
     max_text_chars: int = 20_000,
-) -> tuple:
-    return (_extract(document, page_sizes=page_sizes, max_text_chars=max_text_chars),)
-
+) -> dict:
+    return _extract(
+        document,
+        page_sizes=page_sizes,
+        max_text_chars=max_text_chars,
+    )
