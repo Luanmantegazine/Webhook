@@ -1,0 +1,6 @@
+.onboarding-page .page-title, .onboarding-page .onboarding-subtitle { text-align: center; }
+.selection-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 1rem; margin: 2rem 0; }
+.selection-item { position: relative; cursor: pointer; }
+.selection-overlay { position: absolute; top: 0; left: 0; right: 0; bottom: 0; background-color: rgba(0,0,0,0.6); display: flex; justify-content: center; align-items: center; font-size: 3rem; color: #fff; border-radius: var(--border-radius-medium); opacity: 0; transition: opacity 0.2s ease; border: 3px solid transparent; }
+.selection-item.selected .selection-overlay { opacity: 1; border-color: var(--color-accent); }
+.onboarding-page .cta-button { display: block; margin: 2rem auto; padding: 1rem 2rem; }

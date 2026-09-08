@@ -1,0 +1,179 @@
+/* src/pages/RecommendationFinderPage.css */
+
+.page-container {
+  color: var(--color-text-primary);
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.page-container h1.page-title { /* Adicione a classe 'page-title' ao H1 no JSX */
+  /* Estilos como em ReleaseMoviesPage.css, se desejar consistência */
+  margin-bottom: 1.5rem; /* Menor margem se o input de busca vier logo abaixo */
+}
+
+/* Seção de Busca */
+.search-section {
+  margin-bottom: 2rem; /* Espaço abaixo da seção de busca */
+  /* max-w-xl mx-auto já está no JSX via Tailwind */
+}
+
+.search-input { /* Adicione esta classe ao <input> no JSX */
+  width: 100%;
+  padding: 0.8rem 1rem;
+  border-radius: var(--border-radius-medium);
+  background-color: var(--color-surface);
+  color: var(--color-text-primary);
+  border: 1px solid #383838; /* Borda sutil */
+  font-size: 1rem;
+  transition: border-color var(--transition-speed) ease,
+              box-shadow var(--transition-speed) ease;
+}
+
+.search-input::placeholder {
+  color: var(--color-text-secondary);
+  opacity: 0.7;
+}
+
+.search-input:focus {
+  outline: none;
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 3px rgba(229, 9, 20, 0.25); /* Anel de foco no estilo Netflix */
+}
+
+/* Mensagens de status da busca (carregando, erro) */
+.search-status { /* Adicione esta classe aos <p> de status da busca */
+  margin-top: 0.75rem;
+  font-size: 0.9rem;
+  /* text-align: center; /* Ou à esquerda, conforme preferência */
+  color: var(--color-text-secondary);
+}
+.search-status.error {
+  color: var(--color-accent-hover);
+}
+
+/* Resultados da Busca */
+.search-results-container { /* Adicione ao <div> que envolve a lista de resultados */
+  margin-top: 1rem;
+  background-color: var(--color-surface);
+  padding: 0.5rem; /* Padding interno menor */
+  border-radius: var(--border-radius-medium);
+  max-height: 360px; /* Altura máxima para a lista com scroll */
+  overflow-y: auto;
+  box-shadow: 0 5px 15px rgba(0,0,0,0.3);
+  border: 1px solid #282828;
+}
+
+.search-results-container h3 { /* Se houver um título para os resultados */
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--color-text-primary);
+  margin: 0.5rem 0.5rem 0.75rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid #333;
+}
+
+.search-results-list { /* Adicione à <ul> */
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.search-result-item { /* Adicione à <li> */
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.6rem 0.75rem;
+  border-radius: var(--border-radius-small);
+  cursor: pointer;
+  transition: background-color var(--transition-speed) ease;
+  color: var(--color-text-secondary);
+}
+
+.search-result-item:hover {
+  background-color: rgba(255, 255, 255, 0.07); /* Um hover bem sutil */
+  color: var(--color-text-primary);
+}
+
+.search-result-item img {
+  width: 36px; /* Imagens menores na lista de busca */
+  height: 54px;
+  object-fit: cover;
+  border-radius: var(--border-radius-small);
+  flex-shrink: 0;
+  background-color: var(--color-placeholder);
+}
+
+.search-result-item span {
+  font-size: 0.9rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap; /* Para o '...' funcionar */
+}
+
+/* Seção de Recomendações */
+.recommendations-section {
+  margin-top: 2.5rem;
+}
+
+.recommendations-section h2 {
+  font-size: 1.75rem; /* text-2xl */
+  font-weight: 600;   /* font-semibold */
+  margin-bottom: 1.5rem; /* mb-6 */
+  text-align: center;
+  color: var(--color-text-primary);
+}
+
+.recommendations-section h2 .highlight-movie { /* Adicione ao <strong> com o nome do filme */
+  color: var(--color-accent);
+  /* font-weight: bold; (já é strong) */
+}
+
+/* Mensagens de status/info na seção de recomendações */
+.recommendations-section .status-message {
+  margin-top: 1.5rem;
+  font-size: 1.125rem;
+  text-align: center;
+  color: var(--color-text-secondary);
+  padding: 1rem;
+}
+
+.recommendations-section .status-message.error {
+  color: var(--color-accent-hover);
+  background-color: rgba(229, 9, 20, 0.1);
+  border-radius: var(--border-radius-medium);
+  border: 1px solid var(--color-accent);
+  max-width: 500px;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+/* Mensagem de prompt inicial */
+.initial-prompt { /* Adicione ao <p> da mensagem inicial */
+  margin-top: 2.5rem;
+  font-size: 1.125rem;
+  text-align: center;
+  color: var(--color-text-secondary);
+  max-width: 550px; /* Limita a largura da mensagem */
+  margin-left: auto;
+  margin-right: auto;
+  line-height: 1.7;
+  padding: 1rem;
+  background-color: var(--color-surface);
+  border-radius: var(--border-radius-medium);
+  border: 1px solid #282828;
+}
+.media-type-selector .cta-button {
+  background-color: var(--color-surface);
+  color: var(--color-text-secondary);
+  border: 1px solid var(--color-border-subtle);
+}
+.media-type-selector .cta-button:hover {
+  background-color: rgba(255,255,255,0.1);
+  color: var(--color-text-primary);
+}
+.media-type-selector .cta-button.active {
+  background-color: var(--color-accent);
+  color: var(--color-button-text);
+  border-color: var(--color-accent);
+  box-shadow: 0 0 8px rgba(229, 9, 20, 0.4);
+}

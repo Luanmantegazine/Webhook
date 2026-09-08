@@ -1,0 +1,53 @@
+.for-you-page .page-container {
+  padding: 1.5rem;
+}
+
+.for-you-page .page-title {
+  font-size: 2.5rem; /* ~text-4xl */
+  font-weight: 700;   /* font-bold */
+  text-align: center;
+  margin-bottom: 0.5rem;
+  color: var(--color-text-primary);
+}
+
+.for-you-page .page-subtitle {
+  font-size: 1.125rem; /* ~text-lg */
+  color: var(--color-text-secondary);
+  text-align: center;
+  margin-bottom: 2.5rem;
+  max-width: 600px;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+/* Estilos para mensagens de carregamento, erro ou quando não há recomendações */
+.for-you-page .status-message {
+  margin-top: 2.5rem;
+  font-size: 1.125rem;
+  text-align: center;
+  color: var(--color-text-secondary);
+  padding: 1rem;
+  background-color: var(--color-surface);
+  border-radius: var(--border-radius-medium);
+  border: 1px solid var(--color-border-subtle);
+  max-width: 500px;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+.for-you-page .status-message.error {
+  color: var(--color-accent-hover);
+  background-color: rgba(229, 9, 20, 0.1);
+  border-color: var(--color-accent);
+}
+
+/* Ajustes responsivos */
+@media (min-width: 768px) {
+  .for-you-page .page-title {
+    font-size: 3rem; /* ~text-5xl */
+  }
+
+  .for-you-page .page-subtitle {
+    font-size: 1.25rem; /* ~text-xl */
+  }
+}

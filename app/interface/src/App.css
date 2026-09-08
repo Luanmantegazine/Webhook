@@ -1,0 +1,112 @@
+/* src/App.css (continuação) */
+
+.app-container {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+.app-header {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 1rem 1.5rem;
+  background-color: var(--color-true-black); /* <<< MUDANÇA PRINCIPAL AQUI: Fundo preto puro */
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5); /* Sombra pode ser mais sutil em fundo preto */
+  width: 100%;
+  box-sizing: border-box;
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+
+.app-title-container {
+  /* Sem alterações necessárias por enquanto */
+}
+
+.app-title {
+  font-family: var(--font-family-title);
+  font-size: 2.8rem; /* Leve aumento para mais impacto */
+  color: var(--color-accent); /* LETRAS VERMELHAS (já estava assim) */
+  margin: 0 0 0.5rem 0;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  text-align: center;
+  line-height: 1.1;
+  padding: 0.25rem 0; /* Pequeno padding vertical para o texto respirar */
+}
+
+.app-nav {
+  display: flex;
+  justify-content: center;
+  gap: 0.75rem;
+  width: 100%;
+}
+
+.nav-link {
+  color: var(--color-text-secondary);
+  background-color: transparent;
+  text-decoration: none;
+  font-size: 0.95rem;
+  font-weight: 700;
+  padding: 0.6rem 1.2rem;
+  border-radius: var(--border-radius-medium);
+  border: 2px solid transparent;
+  transition: color var(--transition-speed) ease,
+              border-color var(--transition-speed) ease,
+              background-color var(--transition-speed) ease,
+              transform var(--transition-speed) ease;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  cursor: pointer;
+}
+
+.nav-link:hover {
+  color: var(--color-button-text); /* Texto branco no hover */
+  background-color: var(--color-accent-hover); /* Fundo vermelho mais vivo */
+  transform: translateY(-2px);
+}
+
+.nav-link.active {
+  color: var(--color-button-text); /* Texto branco na aba ativa */
+  background-color: var(--color-accent); /* Fundo vermelho principal */
+  border-color: var(--color-accent);
+  font-weight: 700;
+  box-shadow: 0 0 10px rgba(229, 9, 20, 0.5);
+}
+
+.nav-link:focus-visible {
+  outline: 2px solid var(--color-outline-focus);
+  outline-offset: 2px;
+}
+
+.app-main-content {
+  flex-grow: 1;
+  padding-top: 1rem;
+}
+
+/* Layout responsivo para o header */
+@media (min-width: 768px) {
+  .app-header {
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: center;
+    padding: 1rem 2.5rem;
+  }
+
+  .app-title {
+    font-size: 3.2rem; /* Título ainda maior no desktop */
+    margin: 0;
+    text-align: left;
+  }
+
+  .app-nav {
+    width: auto;
+    gap: 1rem;
+  }
+
+  .nav-link {
+    font-size: 1rem;
+    padding: 0.7rem 1.5rem;
+  }
+}
