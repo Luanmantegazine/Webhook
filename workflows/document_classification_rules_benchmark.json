@@ -1,0 +1,176 @@
+{
+  "tasks": [
+    {
+      "name": "convert_scan",
+      "task": "convert_scanned_image_to_pdf",
+      "inputs": {
+        "image_path": "inputs.image_path",
+        "output_directory": "inputs.adapter_output_directory",
+        "dpi": "inputs.dpi"
+      },
+      "outputs": ["pdf_path"]
+    },
+    {
+      "name": "load_pdf_file",
+      "task": "load_pdf",
+      "inputs": {"input": "tasks.convert_scan.pdf_path"},
+      "outputs": ["pdf"],
+      "dependencies": ["convert_scan"]
+    },
+    {
+      "name": "render_pages",
+      "task": "render_pdf_pages",
+      "inputs": {
+        "pdf": "tasks.load_pdf_file.pdf",
+        "pages": "inputs.pages",
+        "dpi": "inputs.dpi"
+      },
+      "outputs": ["page_images", "page_count"],
+      "dependencies": ["load_pdf_file"]
+    },
+    {
+      "name": "download_doclaynet",
+      "task": "download_hf_model",
+      "inputs": {
+        "repository_id": "inputs.model_repository",
+        "model_name": "inputs.model_filename"
+      },
+      "outputs": ["model_path"]
+    },
+    {
+      "name": "load_layout_model",
+      "task": "load_yolo_model",
+      "inputs": {"model_path": "tasks.download_doclaynet.model_path"},
+      "outputs": ["yolo_model"],
+      "dependencies": ["download_doclaynet"]
+    },
+    {
+      "name": "load_doctr_model",
+      "task": "load_doctr_model",
+      "inputs": {
+        "det_arch": "inputs.doctr_det_arch",
+        "reco_arch": "inputs.doctr_reco_arch"
+      },
+      "outputs": ["doctr_model"]
+    },
+    {
+      "name": "load_table_models",
+      "task": "load_table_transformer_models",
+      "inputs": {
+        "detection_model_name": "inputs.table_detection_model_name",
+        "structure_model_name": "inputs.table_structure_model_name"
+      },
+      "outputs": [
+        "table_detection_model",
+        "table_structure_model",
+        "table_image_processor",
+        "table_model_device"
+      ],
+      "dependencies": ["load_doctr_model"]
+    },
+    {
+      "name": "detect_layout",
+      "task": "detect_and_extract_layout_doctr",
+      "inputs": {
+        "page_images": "tasks.render_pages.page_images",
+        "yolo_model": "tasks.load_layout_model.yolo_model",
+        "doctr_model": "tasks.load_doctr_model.doctr_model",
+        "table_structure_model": "tasks.load_table_models.table_structure_model",
+        "table_image_processor": "tasks.load_table_models.table_image_processor",
+        "table_model_device": "tasks.load_table_models.table_model_device",
+        "confidence_threshold_text": "inputs.confidence_threshold_text",
+        "confidence_threshold_title": "inputs.confidence_threshold_title",
+        "confidence_threshold_section_header": "inputs.confidence_threshold_section_header",
+        "confidence_threshold_list_item": "inputs.confidence_threshold_list_item",
+        "confidence_threshold_caption": "inputs.confidence_threshold_caption",
+        "confidence_threshold_footnote": "inputs.confidence_threshold_footnote",
+        "confidence_threshold_page_header": "inputs.confidence_threshold_page_header",
+        "confidence_threshold_page_footer": "inputs.confidence_threshold_page_footer",
+        "confidence_threshold_table": "inputs.confidence_threshold_table",
+        "confidence_threshold_picture": "inputs.confidence_threshold_picture",
+        "confidence_threshold_formula": "inputs.confidence_threshold_formula",
+        "default_confidence_threshold": "inputs.default_confidence_threshold",
+        "table_structure_threshold": "inputs.table_structure_threshold",
+        "padding": "inputs.region_padding"
+      },
+      "outputs": ["page_contents", "all_annotated_images", "page_words", "page_sizes"],
+      "dependencies": [
+        "render_pages",
+        "load_layout_model",
+        "load_doctr_model",
+        "load_table_models"
+      ]
+    },
+    {
+      "name": "aggregate_content",
+      "task": "aggregate_document_content",
+      "inputs": {
+        "page_contents": "tasks.detect_layout.page_contents",
+        "source_path": "tasks.load_pdf_file.pdf"
+      },
+      "outputs": ["document", "full_text"],
+      "dependencies": ["detect_layout"]
+    },
+    {
+      "name": "extract_classification_features",
+      "task": "extract_document_classification_features",
+      "inputs": {
+        "document": "tasks.aggregate_content.document",
+        "page_sizes": "tasks.detect_layout.page_sizes",
+        "max_text_chars": "inputs.classification_max_text_chars"
+      },
+      "outputs": ["classification_features"],
+      "dependencies": ["aggregate_content", "detect_layout"]
+    },
+    {
+      "name": "classify_document",
+      "task": "classify_document_rules",
+      "inputs": {
+        "classification_features": "tasks.extract_classification_features.classification_features",
+        "confidence_threshold": "inputs.classification_confidence_threshold",
+        "min_score_margin": "inputs.classification_min_score_margin",
+        "min_recognized_characters": "inputs.classification_min_recognized_characters",
+        "classification_mode": {"literal": "evaluate"}
+      },
+      "outputs": ["classification"],
+      "dependencies": ["extract_classification_features"]
+    }
+  ],
+  "inputs": {
+    "image_path": "samples/rvl_cdip/example.tif",
+    "adapter_output_directory": "output/rvl_adapter",
+    "pages": "all",
+    "dpi": 300,
+    "model_repository": "DILHTWD/documentlayoutsegmentation_YOLOv8_ondoclaynet",
+    "model_filename": "yolov8x-doclaynet-epoch64-imgsz640-initiallr1e-4-finallr1e-5.pt",
+    "table_detection_model_name": "microsoft/table-transformer-detection",
+    "table_structure_model_name": "microsoft/table-transformer-structure-recognition",
+    "doctr_det_arch": "db_resnet50",
+    "doctr_reco_arch": "crnn_vgg16_bn",
+    "confidence_threshold_text": 0.2,
+    "confidence_threshold_title": 0.3,
+    "confidence_threshold_section_header": 0.3,
+    "confidence_threshold_list_item": 0.25,
+    "confidence_threshold_caption": 0.3,
+    "confidence_threshold_footnote": 0.25,
+    "confidence_threshold_page_header": 0.3,
+    "confidence_threshold_page_footer": 0.3,
+    "confidence_threshold_table": 0.45,
+    "confidence_threshold_picture": 0.35,
+    "confidence_threshold_formula": 0.2,
+    "default_confidence_threshold": 0.15,
+    "table_structure_threshold": 0.5,
+    "region_padding": 2,
+    "classification_max_text_chars": 20000,
+    "classification_confidence_threshold": 0.45,
+    "classification_min_score_margin": 0.08,
+    "classification_min_recognized_characters": 20
+  },
+  "outputs": {
+    "document": "tasks.aggregate_content.document",
+    "full_text": "tasks.aggregate_content.full_text",
+    "page_sizes": "tasks.detect_layout.page_sizes",
+    "classification_features": "tasks.extract_classification_features.classification_features",
+    "classification": "tasks.classify_document.classification"
+  }
+}

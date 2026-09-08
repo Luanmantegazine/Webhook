@@ -1,0 +1,57 @@
+
+/*
+  O container principal da página já recebe classes Tailwind no JSX para
+  padding, max-width e centralização (ex: "p-4 sm:p-6 w-full max-w-7xl mx-auto").
+  Esta classe .page-container é mais para garantir a cor do texto base e
+  outros estilos globais da página, caso necessário.
+*/
+.page-container {
+  color: var(--color-text-primary);
+  width: 100%; /* Garante que o container ocupe a largura disponível */
+  box-sizing: border-box;
+}
+
+/*
+  O título H1 já recebe classes Tailwind no JSX para tamanho, peso, margem e cor.
+  (ex: "text-3xl sm:text-4xl font-bold mb-6 sm:mb-8 text-center text-white")
+  'text-white' deve ser consistente com var(--color-text-primary).
+  Você pode adicionar estilos específicos aqui se precisar de algo além do Tailwind.
+*/
+.page-container h1.page-title { /* Adicione a classe 'page-title' ao H1 no JSX se quiser este estilo */
+  /* Exemplo: Se quiser uma cor diferente ou espaçamento específico para este título */
+  /* color: var(--color-accent); */
+  /* letter-spacing: 0.5px; */
+}
+
+/* Estilos para mensagens de carregamento, erro ou informativas.
+   O JSX usa classes como "mt-10 text-lg text-center text-gray-400".
+   'text-gray-400' deve ser similar a var(--color-text-secondary).
+*/
+.page-container .status-message {
+  margin-top: 2.5rem; /* Equivalente a mt-10 do Tailwind */
+  font-size: 1.125rem; /* Equivalente a text-lg do Tailwind */
+  text-align: center;
+  color: var(--color-text-secondary);
+  padding: 1rem;
+}
+
+.page-container .status-message.error {
+  color: var(--color-accent-hover, #F40612); /* Cor de destaque para erros */
+  background-color: rgba(229, 9, 20, 0.1); /* Fundo sutil para erro */
+  border-radius: var(--border-radius-medium);
+  border: 1px solid var(--color-accent);
+  max-width: 500px;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+.load-more-trigger {
+  height: 80px; /* Altura para o elemento ser "observável" */
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  width: 100%;
+}
+
+
+/* O componente PosterGrid é estilizado pelo seu próprio PosterGrid.css */

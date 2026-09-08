@@ -1,0 +1,35 @@
+{
+  "taxonomy_version": "rvl-cdip-1.0",
+  "supported_families": [
+    "research_paper",
+    "technical_report",
+    "business_report",
+    "financial_document",
+    "form_structured",
+    "presentation_marketing",
+    "other"
+  ],
+  "not_evaluated_with_rvl_cdip": [
+    "legal_document",
+    "manual_procedure"
+  ],
+  "label_mapping": {
+    "letter": "other",
+    "form": "form_structured",
+    "email": "other",
+    "handwritten": "other",
+    "advertisement": "presentation_marketing",
+    "scientific report": "technical_report",
+    "scientific publication": "research_paper",
+    "specification": "technical_report",
+    "file folder": "other",
+    "news article": "other",
+    "budget": "business_report",
+    "invoice": "financial_document",
+    "presentation": "presentation_marketing",
+    "questionnaire": "form_structured",
+    "resume": "other",
+    "memo": "other"
+  }
+}
+
