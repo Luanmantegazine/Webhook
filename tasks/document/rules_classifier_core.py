@@ -45,6 +45,17 @@ SCHEMA_VERSION = "2.0"
 TAXONOMY_VERSION = "rvl-cdip-2.0"
 CLASSIFIER_VERSION = "rules-rvl-cdip-v3"
 
+#: Provisional operating point, and the single source of truth for it. The task
+#: wrapper and the offline evaluator import these instead of restating them:
+#: the previous revision carried a v1 operating point (0.45/0.08) in both while
+#: the scorer had already moved to the normalised v2 ratio, so the thresholds
+#: the benchmark reported were not the thresholds the module documented. These
+#: values are *not* calibrated — tune them on the validation split and freeze
+#: them before the test split is touched.
+DEFAULT_CONFIDENCE_THRESHOLD = 0.60
+DEFAULT_MIN_SCORE_MARGIN = 0.10
+DEFAULT_MIN_RECOGNIZED_CHARACTERS = 20
+
 #: Document families. ``other`` is both the residual class and the destination
 #: of every abstention; :func:`classify_with_rules` reports ``decision`` and
 #: ``reason`` so the two can be told apart downstream. Evaluation code must
@@ -1220,6 +1231,7 @@ def apply_decision_policy(
                 "decision": "observed",
                 "reason": "no_rules_matched",
                 "confidence": 0.0,
+                "score": top_score,
                 "score_margin": margin,
             }
         return {
@@ -1279,9 +1291,9 @@ def apply_decision_policy(
 
 def classify_with_rules(
     features: dict,
-    confidence_threshold: float = 0.60,
-    min_score_margin: float = 0.10,
-    min_recognized_characters: int = 20,
+    confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+    min_score_margin: float = DEFAULT_MIN_SCORE_MARGIN,
+    min_recognized_characters: int = DEFAULT_MIN_RECOGNIZED_CHARACTERS,
     mode: str = "evaluate",
     weights: dict[str, float] | None = None,
     include_indicators: bool = False,

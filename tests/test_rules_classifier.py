@@ -1,11 +1,33 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 import unittest
 
 from tasks.document.rules_classifier_core import (
+    DOCUMENT_FAMILIES,
+    TAXONOMY_VERSION,
     classify_with_rules,
     extract_classification_features,
 )
+
+TAXONOMY_PATH = Path(__file__).resolve().parents[1] / "config" / "rvl_cdip_taxonomy.json"
+
+
+def unmatched_document() -> dict:
+    """A document long enough to clear the OCR gate but matching no rule.
+
+    200 filler words in a single ``Text`` region: too long for the
+    presentation-marketing text-density rules, too short and too unstructured
+    for the business-report narrative rule, and lexically empty.
+    """
+    body = " ".join(f"lorem{index}" for index in range(200))
+    return {
+        "pages": [
+            {"regions": [{"class_name": "Text", "text": body, "bbox": [10, 10, 1100, 1500]}]}
+        ],
+        "full_text": body,
+    }
 
 
 def make_document(text: str, classes: list[str] | None = None) -> dict:
@@ -51,6 +73,77 @@ class FeatureExtractionTests(unittest.TestCase):
         self.assertEqual(features["class_counts"]["Table"], 1)
         self.assertGreaterEqual(features["checkbox_count"], 2)
         self.assertGreaterEqual(features["blank_field_count"], 2)
+
+
+class TaxonomyConfigTests(unittest.TestCase):
+    """The shipped taxonomy and the classifier must agree.
+
+    They drifted once: the config stayed at the 7-family v1 while the core
+    moved to 10 families, so every letter, memo, e-mail, resume and news
+    article carried an ``other`` ground-truth label that the classifier could
+    never predict. That silently floors recall for four families instead of
+    failing loudly.
+    """
+
+    def setUp(self):
+        with TAXONOMY_PATH.open("r", encoding="utf-8") as handle:
+            self.taxonomy = json.load(handle)
+
+    def test_taxonomy_version_matches_classifier(self):
+        self.assertEqual(self.taxonomy["taxonomy_version"], TAXONOMY_VERSION)
+
+    def test_supported_families_match_classifier(self):
+        self.assertEqual(tuple(self.taxonomy["supported_families"]), DOCUMENT_FAMILIES)
+
+    def test_every_mapped_target_is_a_known_family(self):
+        unknown = set(self.taxonomy["label_mapping"].values()) - set(DOCUMENT_FAMILIES)
+        self.assertEqual(unknown, set())
+
+    def test_every_scored_family_is_reachable_from_some_rvl_label(self):
+        mapped = set(self.taxonomy["label_mapping"].values())
+        unreachable = set(DOCUMENT_FAMILIES) - mapped
+        self.assertEqual(unreachable, set())
+
+
+class DecisionPolicyTests(unittest.TestCase):
+    def test_observe_mode_reports_a_score_when_no_rule_matches(self):
+        """``observe`` used to raise KeyError('score') on this path.
+
+        It is the default mode of the task wrapper and of both workflows, so
+        any document matching no rule aborted the pipeline.
+        """
+        features = extract_classification_features(
+            unmatched_document(), page_sizes=[[1200, 1600]]
+        )
+        result = classify_with_rules(features, mode="observe")
+        self.assertEqual(result["document_family"], "other")
+        self.assertEqual(result["decision"], "observed")
+        self.assertEqual(result["reason"], "no_rules_matched")
+        self.assertEqual(result["score"], 0.0)
+        self.assertEqual(result["confidence"], 0.0)
+
+    def test_every_mode_returns_the_full_result_contract(self):
+        features = extract_classification_features(
+            unmatched_document(), page_sizes=[[1200, 1600]]
+        )
+        required = {
+            "schema_version",
+            "taxonomy_version",
+            "classifier_version",
+            "document_family",
+            "confidence",
+            "score",
+            "decision",
+            "reason",
+            "score_margin",
+            "candidate_scores",
+            "evidence",
+            "thresholds",
+        }
+        for mode in ("observe", "evaluate", "auto"):
+            with self.subTest(mode=mode):
+                result = classify_with_rules(features, mode=mode)
+                self.assertEqual(required - set(result), set())
 
 
 class ClassificationTests(unittest.TestCase):
