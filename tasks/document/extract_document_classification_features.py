@@ -1,5 +1,3 @@
-"""FabricFlow task wrapper for shared classification feature extraction."""
-
 from core.task import task
 
 from tasks.document.rules_classifier_core import extract_classification_features as _extract
@@ -45,3 +43,4 @@ def extract_document_classification_features(
         page_sizes=page_sizes,
         max_text_chars=max_text_chars,
     )
+

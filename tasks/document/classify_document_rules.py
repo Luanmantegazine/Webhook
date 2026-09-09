@@ -72,3 +72,4 @@ def classify_document_rules(
     )
     result["execution_time_ms"] = round((perf_counter() - started) * 1000.0, 4)
     return result
+
