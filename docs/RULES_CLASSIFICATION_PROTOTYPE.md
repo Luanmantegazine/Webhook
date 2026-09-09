@@ -214,12 +214,62 @@ Generated results:
 - `predictions.csv`
 - `report.json`
 
-The report includes accuracy, macro precision/recall/F1, coverage, accuracy on
-accepted predictions, class metrics, confusion matrix, and classifier latency
-at mean/P50/P95/P99.
+### Reading the report
+
+`other` is a real family *and* the sink for every abstention and fallback, and
+in `evaluate` mode the classifier can never positively predict it: a family is
+only ever returned on the `classified` path, and that family always comes from
+the scored nine. **Every `other` in an `evaluate` run is a refusal, not a
+prediction.** Scoring refusals as predictions gives the classifier a true
+positive for `other` each time it declines to answer a file folder or a
+handwritten page, which inflates `other` precision and recall and, through the
+macro average, the headline number too.
+
+The report therefore separates three questions:
+
+| Block | Question it answers |
+| --- | --- |
+| `decisions` | How often did it answer at all? Coverage, refusal rate, and the reason breakdown. |
+| `selective` | How good are the answers it gave? P/R/F1 over accepted predictions only — this is rule quality. |
+| `end_to_end` | `accuracy_declined_as_error` treats a refusal as wrong. `accuracy_declined_as_other` treats it as routing to the fallback template — the deployment view, and the number older reports called plain "accuracy". |
+| `confusion_matrix` | Every sample, with refusals in an explicit `<declined>` column rather than folded into `other`. |
+
+`selective.macro_*` averages over families with non-zero support. A family that
+is predicted but never present cannot be averaged over — its recall is
+undefined, not zero — so its false positives are reported under
+`predictions_outside_support` instead of vanishing from macro precision.
+
+### Full-coverage mode
+
+```bash
+python scripts/evaluate_rules_from_cache.py benchmark_manifest.csv --mode observe
+```
+
+`observe` disables abstention, so the argmax is always reported and the
+confusion matrix is complete. Run it alongside the `evaluate` run: comparing
+the two is what separates rule quality from the rejection policy. It is also
+where families that quietly absorb OCR failures become visible — an illegible
+scan still has an argmax.
+
+### Risk-coverage curve
+
+Every run sweeps the confidence threshold and writes a `risk_coverage` block
+(disable with `--no-risk-coverage`). The sweep re-runs only
+`apply_decision_policy` over the stored scores, never the rule engine, so the
+curve is guaranteed to describe the same firings as the reported operating
+point.
+
+This needs `alnum_character_count`, which `predictions.csv` now carries: the
+OCR-sufficiency gate is part of the decision policy, and a sweep that cannot
+see that count silently mis-reports the whole low-threshold end of the curve as
+higher coverage than the classifier would really give.
 
 ## Important evaluation boundaries
 
+- Never report `end_to_end.accuracy_declined_as_other` as "accuracy" without
+  the qualifier. It credits the classifier for refusing to answer.
+- Report coverage next to every selective metric. A high `selective.accuracy`
+  at low coverage is a classifier that answers only the easy documents.
 - Tune rules and thresholds only on RVL-CDIP validation data.
 - Use the RVL-CDIP test split once for the final reported result.
 - Report classifier latency separately from shared OCR/layout preprocessing.
@@ -238,6 +288,14 @@ From the prototype root:
 python -m unittest discover -s tests -v
 ```
 
-The test suite covers feature extraction, page orientation, invoice, research
-paper, technical report, business report, form, presentation, fallback, and
-insufficient-OCR abstention.
+`tests/test_rules_classifier.py` covers feature extraction, page orientation,
+invoice, research paper, technical report, business report, form, presentation,
+fallback, insufficient-OCR abstention, the decision contract in all three
+modes, and agreement between `config/rvl_cdip_taxonomy.json` and the
+classifier's own family list.
+
+`tests/test_evaluator_metrics.py` covers the evaluator's metric layer, which is
+where the experimental methodology lives: that refusals stay out of the
+classification metrics, that they land in the `<declined>` confusion column,
+that both end-to-end readings are reported and differ, and that false positives
+on a zero-support family are surfaced rather than dropped.
