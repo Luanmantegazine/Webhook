@@ -24,6 +24,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from tasks.document.rules_classifier_core import (  # noqa: E402
+    DEFAULT_CONFIDENCE_THRESHOLD,
+    DEFAULT_MIN_RECOGNIZED_CHARACTERS,
+    DEFAULT_MIN_SCORE_MARGIN,
     DOCUMENT_FAMILIES,
     classify_with_rules,
     extract_classification_features,
@@ -103,9 +106,13 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--output-directory", type=Path, default=Path("output/rules-benchmark"))
-    parser.add_argument("--confidence-threshold", type=float, default=0.45)
-    parser.add_argument("--min-score-margin", type=float, default=0.08)
-    parser.add_argument("--min-recognized-characters", type=int, default=20)
+    parser.add_argument(
+        "--confidence-threshold", type=float, default=DEFAULT_CONFIDENCE_THRESHOLD
+    )
+    parser.add_argument("--min-score-margin", type=float, default=DEFAULT_MIN_SCORE_MARGIN)
+    parser.add_argument(
+        "--min-recognized-characters", type=int, default=DEFAULT_MIN_RECOGNIZED_CHARACTERS
+    )
     args = parser.parse_args()
 
     manifest = args.manifest.resolve()

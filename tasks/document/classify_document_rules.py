@@ -6,7 +6,12 @@ from time import perf_counter
 
 from core.task import task
 
-from tasks.document.rules_classifier_core import classify_with_rules
+from tasks.document.rules_classifier_core import (
+    DEFAULT_CONFIDENCE_THRESHOLD,
+    DEFAULT_MIN_RECOGNIZED_CHARACTERS,
+    DEFAULT_MIN_SCORE_MARGIN,
+    classify_with_rules,
+)
 
 
 @task(
@@ -28,7 +33,7 @@ from tasks.document.rules_classifier_core import classify_with_rules
         "confidence_threshold": {
             "type": "float",
             "required": False,
-            "default": 0.45,
+            "default": DEFAULT_CONFIDENCE_THRESHOLD,
             "min": 0.0,
             "max": 1.0,
             "description": "Minimum winning rule score required for classification",
@@ -36,7 +41,7 @@ from tasks.document.rules_classifier_core import classify_with_rules
         "min_score_margin": {
             "type": "float",
             "required": False,
-            "default": 0.08,
+            "default": DEFAULT_MIN_SCORE_MARGIN,
             "min": 0.0,
             "max": 1.0,
             "description": "Minimum score gap between the two leading families",
@@ -44,7 +49,7 @@ from tasks.document.rules_classifier_core import classify_with_rules
         "min_recognized_characters": {
             "type": "int",
             "required": False,
-            "default": 20,
+            "default": DEFAULT_MIN_RECOGNIZED_CHARACTERS,
             "description": "Minimum OCR alphanumeric characters required for a semantic decision",
         },
         "classification_mode": {
@@ -57,9 +62,9 @@ from tasks.document.rules_classifier_core import classify_with_rules
 )
 def classify_document_rules(
     classification_features: dict,
-    confidence_threshold: float = 0.45,
-    min_score_margin: float = 0.08,
-    min_recognized_characters: int = 20,
+    confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+    min_score_margin: float = DEFAULT_MIN_SCORE_MARGIN,
+    min_recognized_characters: int = DEFAULT_MIN_RECOGNIZED_CHARACTERS,
     classification_mode: str = "observe",
 ) -> dict:
     started = perf_counter()

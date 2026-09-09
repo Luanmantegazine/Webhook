@@ -15,11 +15,23 @@ The prototype supports:
 - `financial_document`
 - `form_structured`
 - `presentation_marketing`
+- `correspondence`
+- `resume`
+- `news_article`
 - `other`
 
 RVL-CDIP does not provide reliable equivalents for `legal_document` or
 `manual_procedure`; those families are intentionally not evaluated in this
 version.
+
+`other` is the residual class *and* the destination of every abstention and
+fallback. `config/rvl_cdip_taxonomy.json` maps only `handwritten` and
+`file folder` to it; letters, memos and e-mails map to `correspondence`,
+`resume` to `resume`, and `news article` to `news_article`. Keeping those five
+RVL labels in `other` — as taxonomy v1 did — gives four families a ground-truth
+label the classifier can never predict, so their recall reads as zero for a
+reason that has nothing to do with rule quality. `tests/test_rules_classifier.py`
+asserts that the config and `DOCUMENT_FAMILIES` agree.
 
 ## Design
 
@@ -79,31 +91,42 @@ Example result:
 
 ```json
 {
-  "schema_version": "1.0",
-  "taxonomy_version": "rvl-cdip-1.0",
-  "classifier_version": "rules-rvl-cdip-v1",
+  "schema_version": "2.0",
+  "taxonomy_version": "rvl-cdip-2.0",
+  "classifier_version": "rules-rvl-cdip-v3",
   "classifier": "rules",
-  "mode": "observe",
+  "mode": "evaluate",
+  "provenance": {},
   "document_family": "financial_document",
   "confidence": 0.9,
+  "score": 0.9,
   "decision": "classified",
-  "reason": "high_confidence_rule_match",
+  "reason": "score_above_threshold",
   "top_candidate": "financial_document",
   "runner_up": "business_report",
   "score_margin": 0.59,
   "candidate_scores": {},
+  "decision_mass": {},
+  "available_mass": {},
   "evidence": {
+    "rules_by_family": {},
     "rules_triggered": [
-      {"rule": "invoice_identifier", "weight": 0.42},
-      {"rule": "amount_due", "weight": 0.24}
+      {"rule": "financial_document.invoice_identifier", "weight": 0.42},
+      {"rule": "financial_document.amount_due", "weight": 0.24}
     ],
+    "suppressed_by_grouping": {},
     "top_features": {}
   },
+  "thresholds": {},
   "execution_time_ms": 1.4,
   "recommended_template": null,
   "fallback_template": "clean_article"
 }
 ```
+
+`confidence` is `score` clipped to `[0, 1]` for downstream consumers; `score`
+is the unclipped evidence ratio the thresholds are actually applied to. Neither
+is a probability. `recommended_template` is populated only in `auto` mode.
 
 Possible decisions:
 
@@ -112,27 +135,42 @@ Possible decisions:
 | `classified` | Score and margin passed their thresholds |
 | `fallback` | No family reached the minimum score; result is `other` |
 | `abstained` | OCR was insufficient or the leading categories were ambiguous |
+| `observed` | `observe` mode only: argmax reported with no abstention |
+
+`observe` exists to separate rule quality from the rejection policy: it yields a
+full-coverage confusion matrix. `evaluate` is the regime whose risk-coverage
+curve should be reported.
 
 ## Default thresholds
 
 ```json
 {
-  "classification_confidence_threshold": 0.45,
-  "classification_min_score_margin": 0.08,
+  "classification_confidence_threshold": 0.60,
+  "classification_min_score_margin": 0.10,
   "classification_min_recognized_characters": 20,
   "classification_max_text_chars": 20000
 }
 ```
 
+These live in `tasks/document/rules_classifier_core.py` as
+`DEFAULT_CONFIDENCE_THRESHOLD`, `DEFAULT_MIN_SCORE_MARGIN` and
+`DEFAULT_MIN_RECOGNIZED_CHARACTERS`; the task wrapper and
+`scripts/evaluate_rules_from_cache.py` import them rather than restating them.
+Change the operating point in one place only.
+
 These are starting values, not final calibrated probabilities. Rule confidence
-is a bounded evidence score. Thresholds must be tuned on the RVL-CDIP
-validation split and frozen before the test split is evaluated.
+is a bounded evidence score — under v2 normalisation a score of 1.0 means "as
+much evidence as the family's strongest groups can supply", so the v1 values
+(0.45 / 0.08) no longer mean what they did. Thresholds must be tuned on the
+RVL-CDIP validation split and frozen before the test split is evaluated.
 
 ## Preparing the RVL-CDIP benchmark
 
-Create a balanced subset by target Hydra family, not by the original RVL label.
-Otherwise the seven original labels mapped to `other` will dominate the
-benchmark.
+Create a balanced subset by target Hydra family, not by the original RVL
+label. The 16 RVL labels collapse unevenly onto the 10 families — three map to
+`correspondence`, two each to `form_structured`, `technical_report`,
+`presentation_marketing` and `other` — so a subset balanced by RVL label is not
+balanced by family.
 
 Recommended first run:
 

@@ -1,5 +1,5 @@
 {
-  "taxonomy_version": "rvl-cdip-1.0",
+  "taxonomy_version": "rvl-cdip-2.0",
   "supported_families": [
     "research_paper",
     "technical_report",
@@ -7,6 +7,9 @@
     "financial_document",
     "form_structured",
     "presentation_marketing",
+    "correspondence",
+    "resume",
+    "news_article",
     "other"
   ],
   "not_evaluated_with_rvl_cdip": [
@@ -14,22 +17,21 @@
     "manual_procedure"
   ],
   "label_mapping": {
-    "letter": "other",
+    "letter": "correspondence",
     "form": "form_structured",
-    "email": "other",
+    "email": "correspondence",
     "handwritten": "other",
     "advertisement": "presentation_marketing",
     "scientific report": "technical_report",
     "scientific publication": "research_paper",
     "specification": "technical_report",
     "file folder": "other",
-    "news article": "other",
+    "news article": "news_article",
     "budget": "business_report",
     "invoice": "financial_document",
     "presentation": "presentation_marketing",
     "questionnaire": "form_structured",
-    "resume": "other",
-    "memo": "other"
+    "resume": "resume",
+    "memo": "correspondence"
   }
 }
-
