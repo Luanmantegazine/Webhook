@@ -10,11 +10,12 @@ contracts, benchmark preparation, execution, and evaluation guidance.
 
 | Path | Contents |
 | --- | --- |
-| `tasks/document/rules_classifier_core.py` | The classifier: feature extraction, rules, scoring, decision policy. No FabricFlow dependency, so it is unit-testable on its own. |
+| `tasks/document/rvl_cdip_eval.py` | Single source of truth for the taxonomy: family list, RVL-CDIP label mapping, rejection targets, and the open mapping decisions. |
+| `tasks/document/rules_classifier_core.py` | The classifier: feature extraction, rules, scoring, family gates, decision policy. No FabricFlow dependency, so it is unit-testable on its own. |
 | `tasks/document/` | FabricFlow `@task` wrappers around the core. |
 | `tasks/dataset/` | Scan-to-PDF adapter for the RVL-CDIP entry point. |
 | `workflows/` | Benchmark workflow, and the translation workflow with classification as a parallel observer. |
-| `config/rvl_cdip_taxonomy.json` | RVL-CDIP label to Hydra family mapping. Kept in sync with the core by the test suite. |
+| `config/rvl_cdip_taxonomy.json` | Declarative copy of the taxonomy. Verified against `tasks/document/rvl_cdip_eval.py` on every evaluation run. |
 | `scripts/` | RVL-CDIP subset preparation and offline evaluation from cached OCR output. |
 | `tests/` | Unit tests. |
 

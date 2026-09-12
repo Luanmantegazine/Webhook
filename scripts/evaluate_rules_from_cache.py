@@ -4,6 +4,31 @@
 The evaluator consumes cache manifests pointing to aggregate-document JSON files,
 with optional page-word artifacts, without rerunning layout detection, OCR,
 translation, or reconstruction.
+
+Reproducibility contract
+------------------------
+Every run records ``SCHEMA_VERSION``, ``TAXONOMY_VERSION``,
+``FEATURE_EXTRACTION_VERSION``, ``CLASSIFIER_VERSION``, ``rule_fingerprint`` and
+``feature_fingerprint`` — in ``report.json`` under ``versions`` and on every row
+of ``predictions.csv`` — so that no stored result has to be dated by hand to
+know what produced it.
+
+Features come from one of exactly two places, and the row says which:
+
+* ``classification_features_path``: the record the benchmark workflow stored,
+  scored as it is;
+* otherwise re-extracted from ``document``, ``page_sizes``, ``page_words`` and
+  ``provenance`` — the same four inputs the workflow feeds to
+  ``extract_document_classification_features``.
+
+The run is refused, rather than degraded, when:
+
+* a feature record carries an unsupported schema or feature-extraction version,
+  or a fingerprint that does not match its own contents;
+* a manifest ``target_family`` is outside the taxonomy;
+* a stored artifact names a rule absent from ``RULE_IDS``;
+* feature versions or fingerprints are mixed inside one evaluation;
+* the shipped taxonomy config contradicts ``tasks/document/rvl_cdip_eval.py``.
 """
 
 from __future__ import annotations
@@ -24,20 +49,58 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from tasks.document.rules_classifier_core import (  # noqa: E402
+    CLASSIFIER_VERSION,
     DEFAULT_CONFIDENCE_THRESHOLD,
     DEFAULT_MIN_RECOGNIZED_CHARACTERS,
     DEFAULT_MIN_SCORE_MARGIN,
     DOCUMENT_FAMILIES,
+    FAMILY_CONFIDENCE_THRESHOLDS,
+    FEATURE_EXTRACTION_VERSION,
+    FeatureContractError,
+    RULE_FINGERPRINT,
+    RULE_IDS,
+    SCHEMA_VERSION,
+    TAXONOMY_VERSION,
     available_channels,
     apply_decision_policy,
+    classifier_versions,
     classify_with_rules,
     extract_classification_features,
+    resolve_family_thresholds,
+    validate_feature_record,
+    validate_rule_ids,
 )
-from tasks.document.rvl_cdip_eval import resolve_evaluation_target  # noqa: E402
+from tasks.document.rvl_cdip_eval import (  # noqa: E402
+    TaxonomyConfigError,
+    is_known_family,
+    resolve_evaluation_target,
+    taxonomy_descriptor,
+    verify_config_file,
+)
 
 
 REQUIRED_MANIFEST_COLUMNS = ("sample_id", "rvl_label", "document_path")
 PAGE_WORDS_PATH_COLUMN = "page_words_path"
+#: Features stored by the benchmark workflow. When present they are used as
+#: they are — the point of caching them is that the evaluation scores exactly
+#: what the pipeline produced — after being checked against this classifier's
+#: feature contract. When absent, features are re-extracted from ``document``,
+#: ``page_sizes``, ``page_words`` and ``provenance``, which is the same input
+#: set the workflow hands to ``extract_document_classification_features``.
+FEATURES_PATH_COLUMN = "classification_features_path"
+PROVENANCE_PATH_COLUMN = "provenance_path"
+VERSION_PREDICTION_COLUMNS = [
+    "schema_version",
+    "taxonomy_version",
+    "feature_extraction_version",
+    "classifier_version",
+    "rule_fingerprint",
+    "feature_fingerprint",
+    "feature_source",
+    "applied_confidence_threshold",
+    "family_gate_status",
+    "gated_families",
+]
 SPLIT_COLUMNS = ("source_manifest_split", "source_split", "split")
 CACHED_ERROR_COLUMNS = ("cached_manifest_input_error", "cached_input_error")
 SOURCE_ERROR_COLUMNS = ("source_manifest_input_error", "source_input_error")
@@ -73,7 +136,7 @@ PREDICTION_CSV_HEADERS = [
     "confidence", "score", "score_margin", "decision", "reason", "recognized_characters",
     "feature_extraction_time_ms", "classifier_time_ms", "rules_triggered", "rules_by_family",
     "candidate_scores", "rule_indicators", "evidence_channels",
-] + GEOMETRY_PREDICTION_COLUMNS
+] + VERSION_PREDICTION_COLUMNS + GEOMETRY_PREDICTION_COLUMNS
 REVIEW_CSV_HEADERS = [
     "sample_id", "rvl_label", "target_family", "source_target_family", "target_kind",
     "rejection_label", "predicted_family", "correct", "decision", "reason", "confidence",
@@ -122,6 +185,21 @@ class BaselineValidationError(EvaluationError):
     """Baseline report has invalid schema or values."""
 
 
+class VersionCompatibilityError(EvaluationError):
+    """Inputs cannot be evaluated together, or cannot be evaluated at all.
+
+    Four distinct situations, all of which produce numbers that look ordinary
+    and mean nothing:
+
+    * a feature record written under a different schema or feature-extraction
+      version than this classifier reads;
+    * a ground-truth family outside the taxonomy;
+    * a stored artifact naming a rule this classifier does not declare;
+    * a *mixture* of versions or fingerprints inside one evaluation, where the
+      aggregate metric describes no single system at all.
+    """
+
+
 @dataclass
 class CachedSample:
     row_number: int
@@ -133,6 +211,42 @@ class CachedSample:
     source_split: str
     features: dict[str, Any]
     feature_extraction_time_ms: float
+    feature_source: str = "reextracted"
+
+
+class FeatureVersionLedger:
+    """Refuse a mixture of feature versions inside one evaluation.
+
+    Pooling records from two feature-extraction versions produces a metric that
+    describes neither. The first record fixes the expected descriptor; the
+    second that disagrees names both samples and stops the run.
+    """
+
+    def __init__(self) -> None:
+        self.descriptor: dict[str, Any] | None = None
+        self.reference_sample: str = ""
+        self.sources: Counter = Counter()
+
+    def record(self, sample_id: str, descriptor: dict[str, Any], source: str) -> None:
+        self.sources[source] += 1
+        if self.descriptor is None:
+            self.descriptor = dict(descriptor)
+            self.reference_sample = sample_id
+            return
+        if dict(descriptor) != self.descriptor:
+            differing = sorted(
+                key
+                for key in set(descriptor) | set(self.descriptor)
+                if descriptor.get(key) != self.descriptor.get(key)
+            )
+            raise VersionCompatibilityError(
+                "Mixed feature versions in one evaluation: sample_id="
+                f"{sample_id} disagrees with sample_id={self.reference_sample} on "
+                f"{', '.join(differing)} "
+                f"({ {key: descriptor.get(key) for key in differing} } vs "
+                f"{ {key: self.descriptor.get(key) for key in differing} }). "
+                "Re-extract the whole cache with one feature-extraction version."
+            )
 
 
 @dataclass
@@ -760,6 +874,7 @@ def _serialize_prediction_for_csv(record: dict[str, Any]) -> dict[str, Any]:
         "candidate_scores",
         "rule_indicators",
         "evidence_channels",
+        "gated_families",
     ):
         serialised[field] = json.dumps(serialised[field], ensure_ascii=False, sort_keys=True)
     return serialised
@@ -786,6 +901,17 @@ def _predict_samples(
             include_indicators=True,
         )
         classifier_time = (perf_counter() - classifier_started) * 1000.0
+        # An indicator vector naming a rule this build does not declare means
+        # the stored artifact and the scorer disagree about the rule set.
+        try:
+            validate_rule_ids(
+                prediction.get("rule_indicators", {}),
+                source=f"sample_id={sample.sample_id} rule_indicators",
+            )
+        except FeatureContractError as error:
+            raise VersionCompatibilityError(str(error)) from error
+        gates = prediction.get("evidence", {}).get("family_gates", {}) or {}
+        predicted_family = prediction["document_family"]
         in_scope_target, target_scope_status = _target_scope_status(
             is_rejection_target=sample.is_rejection_target,
             target_family=sample.target_family,
@@ -821,6 +947,20 @@ def _predict_samples(
                 "candidate_scores": prediction.get("candidate_scores", {}) or {},
                 "rule_indicators": prediction.get("rule_indicators", {}) or {},
                 "evidence_channels": sorted(available_channels(sample.features)),
+                "schema_version": prediction.get("schema_version", ""),
+                "taxonomy_version": prediction.get("taxonomy_version", ""),
+                "feature_extraction_version": prediction.get("feature_extraction_version", ""),
+                "classifier_version": prediction.get("classifier_version", ""),
+                "rule_fingerprint": prediction.get("rule_fingerprint", ""),
+                "feature_fingerprint": prediction.get("feature_fingerprint", ""),
+                "feature_source": sample.feature_source,
+                "applied_confidence_threshold": _coerce_float(
+                    prediction.get("thresholds", {}).get("applied_confidence")
+                ),
+                "family_gate_status": (
+                    gates.get(predicted_family, {}).get("status", "not_gated")
+                ),
+                "gated_families": prediction.get("evidence", {}).get("gated_families", []) or [],
                 "geometry_page_ratio": _coerce_float(sample.features.get("geometry_page_ratio")),
                 "geometry_pages": int(_coerce_float(sample.features.get("geometry_pages"))),
                 "tab_stop_count": int(_coerce_float(sample.features.get("tab_stop_count"))),
@@ -914,6 +1054,10 @@ def _build_family_risk_coverage(
         }
         points = []
         for threshold in thresholds:
+            # Declared family thresholds are offsets from the module default,
+            # so they move with the swept global threshold. A curve that held
+            # them fixed would describe a policy nobody runs.
+            swept_family_thresholds = resolve_family_thresholds(threshold)
             accepted_records = []
             for record in curve_population:
                 decision = apply_decision_policy(
@@ -923,6 +1067,7 @@ def _build_family_risk_coverage(
                     min_score_margin,
                     min_recognized_characters,
                     classification_mode,
+                    swept_family_thresholds,
                 )
                 if (
                     decision["decision"] in ACCEPTED_DECISIONS
@@ -965,6 +1110,10 @@ def _build_family_risk_coverage(
         "configuration": {
             "classification_mode": classification_mode,
             "selected_confidence_threshold": confidence_threshold,
+            "declared_family_confidence_thresholds": dict(FAMILY_CONFIDENCE_THRESHOLDS),
+            "family_confidence_thresholds_at_operating_point": resolve_family_thresholds(
+                confidence_threshold
+            ),
             "min_score_margin": min_score_margin,
             "min_recognized_characters": min_recognized_characters,
         },
@@ -1154,6 +1303,17 @@ def _load_manifest_records(
                         f"(sample_id={sample_id}) has {error}."
                     ) from error
 
+            # A ``target_family`` outside the taxonomy is a ground-truth error
+            # that presents as a classifier error: the family can never be
+            # predicted, so its recall reads as zero for a reason that has
+            # nothing to do with the rules.
+            if target_family and not is_known_family(target_family):
+                raise VersionCompatibilityError(
+                    f"Manifest {manifest_path} row {row_number} (sample_id={sample_id}) "
+                    f"declares target_family={target_family!r}, which is outside taxonomy "
+                    f"{TAXONOMY_VERSION}. Known families: {', '.join(DOCUMENT_FAMILIES)}."
+                )
+
             if cached_error:
                 input_errors.append(
                     ManifestInputErrorRecord(
@@ -1194,7 +1354,24 @@ def _load_manifest_records(
     return classifier_rows, input_errors, split_column
 
 
-def _load_cached_samples(manifest_path: Path, rows: list[dict[str, str]]) -> list[CachedSample]:
+def _resolve_optional_path(
+    manifest_directory: Path, value: str, sample_id: str, column: str
+) -> Path | None:
+    if not value:
+        return None
+    path = (manifest_directory / value).resolve()
+    if not path.is_file():
+        raise ManifestValidationError(
+            f"{column} does not exist for sample_id={sample_id}: {path}"
+        )
+    return path
+
+
+def _load_cached_samples(
+    manifest_path: Path,
+    rows: list[dict[str, str]],
+    ledger: FeatureVersionLedger,
+) -> list[CachedSample]:
     samples = []
     manifest_directory = manifest_path.parent
     for row_number, row in enumerate(rows, start=2):
@@ -1227,18 +1404,57 @@ def _load_cached_samples(manifest_path: Path, rows: list[dict[str, str]]) -> lis
                 )
             page_words = _read_json(page_words_path)
 
+        stored_features_path = _resolve_optional_path(
+            manifest_directory,
+            _non_empty(row.get(FEATURES_PATH_COLUMN)),
+            sample_id,
+            FEATURES_PATH_COLUMN,
+        )
+        provenance_path = _resolve_optional_path(
+            manifest_directory,
+            _non_empty(row.get(PROVENANCE_PATH_COLUMN)),
+            sample_id,
+            PROVENANCE_PATH_COLUMN,
+        )
+
         feature_started = perf_counter()
-        try:
-            features = extract_classification_features(
-                _read_json(document_path),
-                page_sizes=page_sizes,
-                page_words=page_words,
-            )
-        except Exception as error:
-            raise ManifestValidationError(
-                f"Failed feature extraction for sample_id={sample_id}: {error}"
-            ) from error
+        if stored_features_path is not None:
+            # Path 1: score exactly what the workflow stored.
+            features = _read_json(stored_features_path)
+            feature_source = "workflow_cache"
+        else:
+            # Path 2: re-extract from the same four inputs the workflow feeds
+            # to extract_document_classification_features. ``provenance`` is
+            # part of that input set: the features are entirely determined by
+            # the extraction chain, so a record without its identity is not
+            # reproducible even when every number in it is right.
+            document = _read_json(document_path)
+            provenance = None
+            if provenance_path is not None:
+                provenance = _read_json(provenance_path)
+            elif isinstance(document, dict) and isinstance(document.get("provenance"), dict):
+                provenance = document["provenance"]
+            try:
+                features = extract_classification_features(
+                    document,
+                    page_sizes=page_sizes,
+                    page_words=page_words,
+                    provenance=provenance,
+                )
+            except Exception as error:
+                raise ManifestValidationError(
+                    f"Failed feature extraction for sample_id={sample_id}: {error}"
+                ) from error
+            feature_source = "reextracted"
         feature_time = (perf_counter() - feature_started) * 1000.0
+
+        try:
+            descriptor = validate_feature_record(
+                features, source=f"sample_id={sample_id}"
+            )
+        except FeatureContractError as error:
+            raise VersionCompatibilityError(str(error)) from error
+        ledger.record(sample_id, descriptor, feature_source)
         rvl_label = _non_empty(row.get("rvl_label"))
         try:
             evaluation_target = resolve_evaluation_target(rvl_label)
@@ -1258,6 +1474,7 @@ def _load_cached_samples(manifest_path: Path, rows: list[dict[str, str]]) -> lis
                 source_split=_first_non_empty(row, SPLIT_COLUMNS),
                 features=features,
                 feature_extraction_time_ms=feature_time,
+                feature_source=feature_source,
             )
         )
     return samples
@@ -1471,6 +1688,60 @@ def _baseline_extract_metrics(report: dict[str, Any], baseline_path: Path) -> di
     }
 
 
+def _baseline_version_drift(
+    current_versions: dict[str, Any],
+    baseline_report: dict[str, Any],
+    baseline_path: Path,
+) -> dict[str, Any]:
+    """Compare identities with the baseline, and refuse unknown rule ids.
+
+    Drift itself is reported, not refused: comparing a new rule set against an
+    older baseline is the whole point of a regression gate. What *is* refused is
+    a baseline naming rules this build does not declare — those cannot be read
+    as "never fired" without inventing a result.
+    """
+    baseline_versions = baseline_report.get("versions")
+    if not isinstance(baseline_versions, dict):
+        return {
+            "baseline_versions_present": False,
+            "note": (
+                "Baseline report predates version recording; it cannot be checked for "
+                "schema, taxonomy, feature or rule-set compatibility."
+            ),
+        }
+
+    baseline_rule_ids = baseline_versions.get("rule_ids")
+    if baseline_rule_ids is not None:
+        try:
+            validate_rule_ids(baseline_rule_ids, source=f"baseline {baseline_path} rule_ids")
+        except FeatureContractError as error:
+            raise VersionCompatibilityError(str(error)) from error
+
+    tracked = (
+        "schema_version",
+        "taxonomy_version",
+        "feature_extraction_version",
+        "classifier_version",
+        "rule_fingerprint",
+        "feature_fingerprint",
+    )
+    differences = {
+        key: {"baseline": baseline_versions.get(key), "current": current_versions.get(key)}
+        for key in tracked
+        if baseline_versions.get(key) != current_versions.get(key)
+    }
+    return {
+        "baseline_versions_present": True,
+        "identical": not differences,
+        "differences": differences,
+        "interpretation": (
+            "A differing rule_fingerprint or feature_extraction_version means the two "
+            "reports describe different systems; the regression gate still runs, but the "
+            "comparison is between systems, not between runs of one system."
+        ),
+    }
+
+
 def _build_baseline_comparison(
     current_report: dict[str, Any],
     baseline_report: dict[str, Any],
@@ -1560,6 +1831,9 @@ def _build_baseline_comparison(
     return {
         "baseline_report": str(baseline_path),
         "overall_passed": len(failures) == 0,
+        "version_drift": _baseline_version_drift(
+            current_report.get("versions", {}), baseline_report, baseline_path
+        ),
         "gates": gates,
     }, failures
 
@@ -1613,8 +1887,17 @@ def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         raise ManifestValidationError(f"Manifest does not exist: {manifest}")
     scoped_target_families = frozenset(_parse_target_families(args.target_families))
 
+    # The shipped taxonomy config and the taxonomy module must agree before a
+    # single row is read: a divergence means ground truth is ambiguous, and
+    # every metric downstream would silently inherit the ambiguity.
+    try:
+        taxonomy_check = verify_config_file()
+    except TaxonomyConfigError as error:
+        raise VersionCompatibilityError(str(error)) from error
+
     classifier_rows, input_errors, split_column = _load_manifest_records(manifest)
-    samples = _load_cached_samples(manifest, classifier_rows)
+    feature_versions = FeatureVersionLedger()
+    samples = _load_cached_samples(manifest, classifier_rows, feature_versions)
     classifier_eligible_samples = [
         sample for sample in samples if not sample.is_rejection_target
     ]
@@ -1747,16 +2030,47 @@ def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     report_configuration = {
         "classification_mode": args.classification_mode,
         "confidence_threshold": selected_config["confidence_threshold"],
+        "family_confidence_thresholds": resolve_family_thresholds(
+            selected_config["confidence_threshold"]
+        ),
+        "declared_family_confidence_thresholds": dict(FAMILY_CONFIDENCE_THRESHOLDS),
         "min_score_margin": selected_config["min_score_margin"],
         "min_recognized_characters": selected_config["min_recognized_characters"],
         "calibrate_validation": bool(args.calibrate_validation),
         "evaluation_target_source": "tasks.document.rvl_cdip_eval.CLASS_TO_FAMILY",
+    }
+
+    # Everything a later reader needs to know whether two reports may be
+    # compared at all. Recorded whether or not a baseline is supplied.
+    observed = feature_versions.descriptor or {}
+    versions_block = {
+        "schema_version": SCHEMA_VERSION,
+        "taxonomy_version": TAXONOMY_VERSION,
+        "feature_extraction_version": FEATURE_EXTRACTION_VERSION,
+        "classifier_version": CLASSIFIER_VERSION,
+        "rule_fingerprint": RULE_FINGERPRINT,
+        "feature_fingerprint": observed.get("feature_fingerprint", ""),
+        "observed_feature_versions": dict(observed),
+        "feature_sources": dict(sorted(feature_versions.sources.items())),
+        "metric_schema_version": METRIC_SCHEMA_VERSION,
+        "rule_count": len(RULE_IDS),
+        "rule_ids": list(RULE_IDS),
+        "classifier": classifier_versions(),
+        "taxonomy": taxonomy_descriptor(),
+        "taxonomy_config_check": taxonomy_check,
+        "refusals": (
+            "The evaluator refuses: feature records under an unsupported schema or "
+            "feature-extraction version; a target_family outside the taxonomy; rule ids "
+            "absent from RULE_IDS; and any mixture of feature versions or fingerprints "
+            "within one evaluation."
+        ),
     }
     if scoped_target_families:
         report_configuration["target_families"] = sorted(scoped_target_families)
 
     report = {
         "configuration": report_configuration,
+        "versions": versions_block,
         "metrics": metrics,
         "manifest": {
             "path": str(manifest),
@@ -1857,6 +2171,9 @@ def main() -> int:
     args = parser.parse_args()
     try:
         status_code, payload = _run(args)
+    except VersionCompatibilityError as error:
+        print(f"ERROR: refusing to evaluate: {error}", file=sys.stderr)
+        return 2
     except EvaluationError as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 2
