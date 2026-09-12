@@ -1,5 +1,6 @@
 {
   "taxonomy_version": "rvl-cdip-2.0",
+  "source_of_truth": "tasks/document/rvl_cdip_eval.py (CLASS_TO_FAMILY); this file is the declarative copy and is verified against it by verify_config_file()",
   "supported_families": [
     "research_paper",
     "technical_report",
@@ -15,6 +16,41 @@
   "not_evaluated_with_rvl_cdip": [
     "legal_document",
     "manual_procedure"
+  ],
+  "rejection_labels": [
+    "handwritten",
+    "file folder"
+  ],
+  "rejection_criterion": "Rejection targets are not classifier families: the only correct outcome is abstained or fallback.",
+  "scientific_report_family": "technical_report",
+  "press_release_policy": "not_news_article",
+  "pending_decisions": [
+    {
+      "decision": "scientific_report_family",
+      "status": "pending",
+      "selected": "technical_report",
+      "choices": [
+        "technical_report",
+        "research_paper"
+      ],
+      "affects": [
+        "ground_truth"
+      ],
+      "note": "RVL-CDIP 'scientific report' mixes institutional/laboratory reports with preprint-shaped documents. Changing this changes ground truth; metrics computed under different selections must not be pooled."
+    },
+    {
+      "decision": "press_release_policy",
+      "status": "pending",
+      "selected": "not_news_article",
+      "choices": [
+        "not_news_article",
+        "news_article"
+      ],
+      "affects": [
+        "news_article_gate"
+      ],
+      "note": "RVL-CDIP has no press-release class. Under 'not_news_article' press-release markers block the news_article gate; under 'news_article' they do not."
+    }
   ],
   "label_mapping": {
     "letter": "correspondence",

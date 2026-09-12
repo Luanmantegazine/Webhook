@@ -132,6 +132,27 @@ def guard_split(rows: Sequence[dict], declared: str | None, reported: str) -> st
     return name
 
 
+def _gated_families(row: dict) -> frozenset[str]:
+    """Families the classifier removed from contention for this document.
+
+    Family gates are evaluated from the indicator vector *and* from raw
+    features (the cross-family guards), and the CSV carries only the former.
+    The stored ``gated_families`` column is therefore replayed as recorded: it
+    is exact for the baseline configuration, and for an ablated one it is a
+    lower bound — forcing a rule false can additionally close a gate that was
+    open, which this cannot see. Without the column the ablation silently
+    measures a ranking the classifier never produces, so its absence is worth
+    noticing in the output.
+    """
+    raw = row.get("gated_families")
+    if not raw:
+        return frozenset()
+    try:
+        return frozenset(json.loads(raw))
+    except (json.JSONDecodeError, TypeError):
+        return frozenset()
+
+
 def _channels(row: dict) -> frozenset[str]:
     raw = row.get("evidence_channels")
     if raw:
@@ -173,8 +194,12 @@ def ranking_accuracy(
             "total_pages": 1 if "multipage" in available else 0,
         }
         breakdown = core.score_families(features, indicators, weights)
+        gated = _gated_families(row)
         ranked = sorted(
-            ((family, entry["score"]) for family, entry in breakdown.items()),
+            (
+                (family, 0.0 if family in gated else entry["score"])
+                for family, entry in breakdown.items()
+            ),
             key=lambda item: (-item[1], item[0]),
         )
         if ranked and ranked[0][1] > 0 and ranked[0][0] == want:
@@ -278,6 +303,11 @@ def main(argv: list[str] | None = None) -> int:
     baseline = correct / total if total else 0.0
     reported_split = _normalise_split(args.reported_split)
     print(f"source_split={split} · reported_split={reported_split}")
+    if "gated_families" not in rows[0]:
+        print(
+            "AVISO: coluna 'gated_families' ausente; os gates por família não serão "
+            "replicados e o ranking aqui pode divergir do classificador."
+        )
     print(f"documentos classificáveis={total}")
     print(f"acurácia de ranking (base) = {correct}/{total} = {baseline:.4f}\n")
 

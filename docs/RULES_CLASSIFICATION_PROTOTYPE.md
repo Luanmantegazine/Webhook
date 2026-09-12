@@ -25,13 +25,49 @@ RVL-CDIP does not provide reliable equivalents for `legal_document` or
 version.
 
 `other` is the residual class *and* the destination of every abstention and
-fallback. `config/rvl_cdip_taxonomy.json` maps only `handwritten` and
-`file folder` to it; letters, memos and e-mails map to `correspondence`,
-`resume` to `resume`, and `news article` to `news_article`. Keeping those five
-RVL labels in `other` — as taxonomy v1 did — gives four families a ground-truth
-label the classifier can never predict, so their recall reads as zero for a
-reason that has nothing to do with rule quality. `tests/test_rules_classifier.py`
-asserts that the config and `DOCUMENT_FAMILIES` agree.
+fallback. `handwritten` and `file folder` map to it; letters, memos and e-mails
+map to `correspondence`, `resume` to `resume`, and `news article` to
+`news_article`. Keeping those five RVL labels in `other` — as taxonomy v1 did —
+gives four families a ground-truth label the classifier can never predict, so
+their recall reads as zero for a reason that has nothing to do with rule
+quality.
+
+## Taxonomy: one module, and what is still open
+
+`tasks/document/rvl_cdip_eval.py` is the single source of truth for the family
+list, the RVL-CDIP label mapping and the rejection targets. The classifier
+imports `DOCUMENT_FAMILIES`, `SCORED_FAMILIES` and `TAXONOMY_VERSION` from it;
+the evaluator resolves every manifest row through `resolve_evaluation_target`;
+`config/rvl_cdip_taxonomy.json` is a declarative copy that `verify_config_file()`
+checks on every evaluation run and refuses to reconcile silently.
+
+| Label | Family | Status |
+| --- | --- | --- |
+| `scientific publication` | `research_paper` | Settled |
+| `scientific report` | `technical_report` (default) or `research_paper` | **Open** — `scientific_report_family` |
+| press releases (no RVL class) | not `news_article` (default) | **Open** — `press_release_policy` |
+
+Both open decisions are declared in one place, reported under
+`versions.taxonomy.pending_decisions` in every `report.json`, and configurable
+through the same keys in `config/rvl_cdip_taxonomy.json`. Changing
+`scientific_report_family` changes ground truth: metrics computed under
+different selections must not be pooled. `press_release_policy` changes only
+the `news_article` gate, not the labels.
+
+## Versions and fingerprints
+
+| Identifier | Moves when |
+| --- | --- |
+| `SCHEMA_VERSION` | The external contract of the feature record or the result changes. Adding a field does not move it. |
+| `TAXONOMY_VERSION` | The family set or the label mapping changes. |
+| `FEATURE_EXTRACTION_VERSION` | Any derived feature's definition changes. |
+| `feature_fingerprint` | The emitted feature key set or the extraction version changes. Recomputable from the record itself. |
+| `CLASSIFIER_VERSION` / `rule_fingerprint` | Any rule, weight, group, channel, gate, blocker, family threshold or decision-group count changes. |
+
+The rule fingerprint is computed from rule *source* where available rather than
+from bytecode reprs: nested code objects render with their memory address, so
+the previous digest differed on every process — a fingerprint that cannot be
+compared across runs cannot support a reproducibility claim.
 
 ## Design
 
@@ -51,7 +87,9 @@ does not select a template in this version.
 
 | Prototype path | Hydra target |
 | --- | --- |
+| `tasks/document/rvl_cdip_eval.py` | `tasks/document/rvl_cdip_eval.py` |
 | `tasks/document/rules_classifier_core.py` | `tasks/document/rules_classifier_core.py` |
+| `tasks/document/word_geometry.py` | `tasks/document/word_geometry.py` |
 | `tasks/document/extract_document_classification_features.py` | `tasks/document/extract_document_classification_features.py` |
 | `tasks/document/classify_document_rules.py` | `tasks/document/classify_document_rules.py` |
 | `tasks/dataset/convert_scanned_image_to_pdf.py` | `tasks/dataset/convert_scanned_image_to_pdf.py` |
@@ -91,9 +129,12 @@ Example result:
 
 ```json
 {
-  "schema_version": "2.0",
+  "schema_version": "2.1",
   "taxonomy_version": "rvl-cdip-2.0",
-  "classifier_version": "rules-rvl-cdip-v3",
+  "feature_extraction_version": "2.3",
+  "classifier_version": "rules-rvl-cdip-v5+<rule_fingerprint>",
+  "rule_fingerprint": "<12 hex>",
+  "feature_fingerprint": "ff-<12 hex>",
   "classifier": "rules",
   "mode": "evaluate",
   "provenance": {},
@@ -109,6 +150,9 @@ Example result:
   "decision_mass": {},
   "available_mass": {},
   "evidence": {
+    "family_gates": {},
+    "pre_gate_scores": {},
+    "gated_families": [],
     "rules_by_family": {},
     "rules_triggered": [
       {"rule": "financial_document.invoice_identifier", "weight": 0.42},
@@ -117,7 +161,14 @@ Example result:
     "suppressed_by_grouping": {},
     "top_features": {}
   },
-  "thresholds": {},
+  "thresholds": {
+    "confidence": 0.6,
+    "family_confidence": {"correspondence": 0.5},
+    "declared_family_confidence": {"correspondence": 0.5},
+    "applied_confidence": 0.6,
+    "minimum_score_margin": 0.1,
+    "minimum_recognized_characters": 20
+  },
   "execution_time_ms": 1.4,
   "recommended_template": null,
   "fallback_template": "clean_article"
@@ -140,6 +191,51 @@ Possible decisions:
 `observe` exists to separate rule quality from the rejection policy: it yields a
 full-coverage confusion matrix. `evaluate` is the regime whose risk-coverage
 curve should be reported.
+
+## Family gates
+
+Scoring answers "how much evidence is there"; a gate answers the question a
+weighted sum cannot — *is this the kind of evidence that may decide this family
+at all?* Gates are declared as data in `FAMILY_GATES`, evaluated by
+`evaluate_family_gates`, and applied in exactly one place: a family whose gate
+is not satisfied has its score set to `0.0` before ranking. The pre-gate score
+is kept in `evidence.pre_gate_scores`, and `evidence.family_gates` records, per
+family, which evidence groups fired, which rules merely corroborated, and which
+guard vetoed it.
+
+Negative weights were the alternative, and they are close to unreadable: a large
+negative weight both suppresses a family and rescales every score around it, and
+no reader of the output can tell which of the two happened.
+
+| Family | Accepts when | Corroborating only | Guards against |
+| --- | --- | --- | --- |
+| `form_structured` | one strong primary (`form_heading`, `questionnaire_heading`) **or** two primaries (`checkboxes`, `blank_fields`) | `field_labels`, `short_field_regions`, `label_value_lines`, `tab_stop_alignment`, `field_geometry_regularity` | invoices, specifications, news, advertisements, budgets, resumes |
+| `correspondence` | two independent signals among header block, e-mail markers, salutation, closing, memo heading, letter geometry, letter body | — | forms, news reporting |
+| `research_paper` | two of: academic structure, citations, editorial metadata, academic layout | `academic_vocabulary` | news reporting, invoices, forms |
+| `news_article` | two groups, one of which must be a journalistic source, a dateline, or the news layout | — | scientific publications, advertisements, forms, institutional correspondence, press releases |
+| `presentation_marketing` | one positive visual evidence: relevant pictures, landscape slide structure, short title over lists, or high visual area against low narrative density | `presentation_terms` | sparse or low-quality OCR with no visual evidence, forms, invoices |
+
+Three consequences worth stating explicitly, because they were the family's
+failure modes:
+
+- `field_labels` alone, `label_value_lines` alone, and geometry alone can never
+  classify a form. The old broad `field_grid` rule is deliberately not
+  reintroduced: prose, tables and columned reports all satisfy it.
+- Generic academic vocabulary (`results`, `method`, `study`, `report`) and a
+  bare date can never classify a research paper.
+- Short text, sparse text and low OCR confidence are guards, never evidence. A
+  handwritten page is not a presentation for having little text on it.
+
+### Per-family operating points
+
+`correspondence` is accepted at a lower threshold than the rest — the family's
+signals are individually weak and jointly decisive — and this is declared in
+`FAMILY_CONFIDENCE_THRESHOLDS`, not bought by lowering the global threshold for
+every family. A declared value is an *offset* from the module default, resolved
+by `resolve_family_thresholds` at whatever global threshold is in force, so a
+swept risk-coverage curve keeps describing the policy that actually runs. Every
+result reports `thresholds.family_confidence` and the
+`applied_confidence_threshold` of its own decision.
 
 ## Default thresholds
 
@@ -197,10 +293,36 @@ calibration can then use the cached outputs without rerunning YOLO or docTR.
 For offline evaluation, create a CSV manifest:
 
 ```csv
-sample_id,rvl_label,target_family,document_path,page_sizes_path
-rvl-001,invoice,financial_document,cache/rvl-001/document.json,cache/rvl-001/page_sizes.json
-rvl-002,form,form_structured,cache/rvl-002/document.json,cache/rvl-002/page_sizes.json
+sample_id,rvl_label,target_family,document_path,page_sizes_path,page_words_path,classification_features_path,provenance_path,source_manifest_split
+rvl-001,invoice,financial_document,cache/rvl-001/document.json,cache/rvl-001/page_sizes.json,cache/rvl-001/page_words.json,cache/rvl-001/features.json,cache/rvl-001/provenance.json,validation
+rvl-002,form,form_structured,cache/rvl-002/document.json,cache/rvl-002/page_sizes.json,,,,validation
 ```
+
+Features come from one of exactly two places, and `predictions.csv` records
+which in `feature_source`:
+
+- `classification_features_path` — the record the workflow stored, scored as it
+  is (`feature_source=workflow_cache`);
+- otherwise re-extracted from `document`, `page_sizes`, `page_words` and
+  `provenance` (`feature_source=reextracted`) — the same four inputs the
+  workflow feeds to `extract_document_classification_features`. When
+  `provenance_path` is absent, a `provenance` object inside the cached document
+  is used.
+
+The run is **refused**, not degraded, when a feature record carries an
+unsupported `schema_version` or `feature_extraction_version` or a fingerprint
+that disagrees with its own contents; when a manifest `target_family` is outside
+the taxonomy; when a stored artifact names a rule absent from `RULE_IDS`; when
+feature versions or fingerprints are mixed inside one evaluation; or when
+`config/rvl_cdip_taxonomy.json` contradicts `tasks/document/rvl_cdip_eval.py`.
+Each of those produces numbers that look ordinary and describe nothing.
+
+`report.json` carries a `versions` block with `SCHEMA_VERSION`,
+`TAXONOMY_VERSION`, `FEATURE_EXTRACTION_VERSION`, `CLASSIFIER_VERSION`,
+`rule_fingerprint`, `feature_fingerprint`, the full `rule_ids` list and the
+resolved taxonomy — including its pending decisions. Every row of
+`predictions.csv` carries the same six identifiers, so a prediction can be
+traced to the system that produced it without consulting the run that wrote it.
 
 Then run:
 

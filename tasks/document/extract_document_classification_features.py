@@ -115,7 +115,16 @@ def extract_document_classification_features(
         }.items()
         if value not in ("", None)
     }
-    resolved_provenance = dict(provenance) if isinstance(provenance, dict) else inferred_provenance
+    # An explicit provenance override augments the inferred chain rather than
+    # erasing it: a caller that supplies one field (a corpus name, a cache id)
+    # used to drop the model identities that make the features reproducible.
+    resolved_provenance = dict(inferred_provenance)
+    if isinstance(provenance, dict):
+        resolved_provenance.update(
+            {key: value for key, value in provenance.items() if value not in ("", None)}
+        )
+    # Single-output task: the declared ``classification_features`` output is
+    # this dict, never a singleton tuple.
     return _extract(
         document,
         page_sizes=page_sizes,

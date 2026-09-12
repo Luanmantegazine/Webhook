@@ -73,6 +73,7 @@ _DEFAULT_GEOMETRY_FEATURES = {
     "line_pitch_regularity": 0.0,
     "indent_ratio": 0.0,
     "short_line_ratio": 0.0,
+    "narrative_line_ratio": 0.0,
     "centered_line_ratio": 0.0,
     "top_band_header_ratio": 0.0,
     "space_width": 0.0,
@@ -322,6 +323,18 @@ def _page_geometry(words: list[Word], page_size: tuple[float, float]) -> dict | 
         1 for line in lines if (max(w.x1 for w in line) - line[0].x0) < 0.60 * page_width
     )
 
+    # A narrative line is a *run of prose*: enough words on one line, and not
+    # broken into columns by a wide gap. Forms, slides, tables of entries and
+    # captioned visuals all produce lines that are short, gapped, or both. The
+    # ratio is what separates "little text" (which says nothing about a family)
+    # from "little narrative text" (which does), so no rule needs to reach for
+    # raw word counts or OCR quality as a stand-in for layout.
+    narrative_lines = sum(
+        1
+        for line, has_gap in zip(lines, wide_gap_flags)
+        if len(line) >= 8 and not has_gap
+    )
+
     page_centre = page_width / 2.0
     centered = 0
     for line in lines:
@@ -373,6 +386,7 @@ def _page_geometry(words: list[Word], page_size: tuple[float, float]) -> dict | 
         "line_pitch_regularity": round(max(0.0, line_pitch_regularity), 4),
         "indent_ratio": _safe_ratio(indented, len(lines)),
         "short_line_ratio": _safe_ratio(short_lines, len(lines)),
+        "narrative_line_ratio": _safe_ratio(narrative_lines, len(lines)),
         "centered_line_ratio": _safe_ratio(centered, len(lines)),
         "top_band_header_ratio": round(header_excess, 4),
         "space_width": round(space_width, 2),
@@ -461,6 +475,7 @@ def extract_geometry_features(
         "line_pitch_regularity": weighted("line_pitch_regularity"),
         "indent_ratio": weighted("indent_ratio"),
         "short_line_ratio": weighted("short_line_ratio"),
+        "narrative_line_ratio": weighted("narrative_line_ratio"),
         "centered_line_ratio": weighted("centered_line_ratio"),
         "top_band_header_ratio": weighted("top_band_header_ratio"),
         "space_width": weighted("space_width"),

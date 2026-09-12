@@ -6,7 +6,7 @@ and offline calibration notebooks.
 
 Design contract
 ---------------
-Four responsibilities are kept strictly separate so that each can be inspected,
+Five responsibilities are kept strictly separate so that each can be inspected,
 replaced or calibrated on its own:
 
 1. **Feature extraction** (:func:`extract_classification_features`) turns a
@@ -21,10 +21,29 @@ replaced or calibrated on its own:
    strongest member of a group contributes; the normalising denominator is the
    evidence mass actually available for the document, so families with
    different numbers of rules remain comparable under a single threshold.
-4. **Decision policy** (:func:`apply_decision_policy`) turns scores into a
+4. **Family gates** (:data:`FAMILY_GATES`, :func:`evaluate_family_gates`) state,
+   as data, what *kind* of evidence may decide a family: which rules are primary
+   and which merely corroborate, how many independent groups a decision needs,
+   and which cross-family guards veto it. A family whose gate is not satisfied
+   is removed from contention before ranking; the pre-gate score and the gate's
+   own reasoning are both reported. Gates replace negative weights, which
+   suppressed a family and silently rescaled every score around it at the same
+   time, with no way for a reader to tell the two effects apart.
+5. **Decision policy** (:func:`apply_decision_policy`) turns scores into a
    family, an abstention, or a fallback. It is a pure function of the scores and
    the thresholds, which is what allows a risk-coverage curve to be swept
-   offline without re-running the rules.
+   offline without re-running the rules. Families may declare their own
+   operating point (:data:`FAMILY_CONFIDENCE_THRESHOLDS`), resolved as an offset
+   from the global threshold so a sweep keeps describing the policy that runs.
+
+Reproducibility
+---------------
+Every result carries the identity of what produced it: ``schema_version``,
+``taxonomy_version``, ``feature_extraction_version``, ``classifier_version``,
+``rule_fingerprint`` and ``feature_fingerprint``. The rule fingerprint covers
+rules, weights, groups, channels, gates, blockers, family thresholds and the
+decision-group count — everything that can change a decision — and is stable
+across processes and interpreter versions.
 
 The weights shipped in :data:`DEFAULT_WEIGHTS` are a documented prior, not a
 calibrated model. Any experimental claim should either calibrate them on a
@@ -36,18 +55,38 @@ from __future__ import annotations
 
 from collections import Counter
 import hashlib
+import inspect
 import math
 import re
+from types import CodeType
 import unicodedata
 from typing import Any, Callable, Iterable, NamedTuple
 
+from tasks.document.rvl_cdip_eval import (
+    DOCUMENT_FAMILIES,
+    PRESS_RELEASE_POLICY,
+    SCORED_FAMILIES,
+    TAXONOMY_VERSION,
+    taxonomy_descriptor,
+)
 from tasks.document.word_geometry import extract_geometry_features
 
+#: External contract version of the feature record and of the classification
+#: result. It changes only when a *consumer* would have to change: adding a
+#: feature key or a reporting field does not move it, removing or redefining
+#: one does. ``feature_extraction_version`` and the fingerprints below carry
+#: the finer-grained identity.
 SCHEMA_VERSION = "2.1"
-TAXONOMY_VERSION = "rvl-cdip-2.0"
+
+#: Feature records produced under any other schema version cannot be pooled
+#: with these. The evaluator refuses them rather than silently coercing.
+SUPPORTED_FEATURE_SCHEMA_VERSIONS = frozenset({SCHEMA_VERSION})
+
 # Bump whenever a derived feature's definition changes. The fingerprint then
 # invalidates stale cached features even when the emitted key set is unchanged.
-FEATURE_EXTRACTION_VERSION = "2.2"
+# 2.3: narrative_line_ratio, academic/editorial metadata counts, quote and
+# press-release markers, marketing lexicon, technical-strength counters.
+FEATURE_EXTRACTION_VERSION = "2.3"
 
 #: Provisional operating point, and the single source of truth for it. The task
 #: wrapper and the offline evaluator import these instead of restating them:
@@ -60,31 +99,11 @@ DEFAULT_CONFIDENCE_THRESHOLD = 0.60
 DEFAULT_MIN_SCORE_MARGIN = 0.10
 DEFAULT_MIN_RECOGNIZED_CHARACTERS = 20
 
-#: Document families. ``other`` is both the residual class and the destination
-#: of every abstention; :func:`classify_with_rules` reports ``decision`` and
-#: ``reason`` so the two can be told apart downstream. Evaluation code must
-#: never treat them as the same outcome. This public taxonomy retains
-#: ``business_report`` for compatibility, although it is not an RVL-CDIP
-#: classification candidate because no canonical target maps to it.
-DOCUMENT_FAMILIES = (
-    "research_paper",
-    "technical_report",
-    "business_report",
-    "financial_document",
-    "form_structured",
-    "presentation_marketing",
-    "correspondence",
-    "resume",
-    "news_article",
-    "other",
-)
-
-#: RVL-CDIP classification candidates. Keep the public family taxonomy above
-#: stable, but exclude ``business_report`` from scoring so it cannot become a
-#: false-positive top candidate in the canonical evaluation.
-SCORED_FAMILIES = tuple(
-    family for family in DOCUMENT_FAMILIES if family not in {"other", "business_report"}
-)
+#: ``DOCUMENT_FAMILIES``, ``SCORED_FAMILIES`` and ``TAXONOMY_VERSION`` are
+#: re-exported from :mod:`tasks.document.rvl_cdip_eval`, which is the single
+#: source of truth for the taxonomy. They are *not* redefined here: the label
+#: mapping, the family list and the classifier used to declare the taxonomy
+#: independently, and any one of them could change without the others.
 
 FAMILY_TEMPLATES = {
     "research_paper": "two_column_academic",
@@ -251,6 +270,53 @@ _DATELINE_RE = re.compile(
 _ATTRIBUTION_RE = re.compile(
     r"\b(?:said|says|told reporters|according to|commented)\b", re.IGNORECASE
 )
+# Straight and typographic quotation marks. A news body quotes sources; an
+# attribution verb without a quotation is a narrative verb like any other, and
+# on its own says nothing about the family.
+_QUOTE_RE = re.compile(r"[\u201c\u201d\u00ab\u00bb]|(?<![\w\"])\"(?=[A-Za-z])")
+
+# ``For immediate release`` is the defining surface of a press release. RVL-CDIP
+# has no press-release class, so whether these documents may be accepted as
+# news_article is a taxonomy decision, declared once in
+# :mod:`tasks.document.rvl_cdip_eval` and consumed by exactly one gate.
+_PRESS_RELEASE_RE = re.compile(
+    r"\bfor immediate release\b|\bpress release\b|\bnews release\b|"
+    r"\bfor release\b.{0,40}\b(?:a\.m\.|p\.m\.|immediately)\b",
+    re.IGNORECASE,
+)
+
+# Author and affiliation block of an academic paper. Deliberately institutional:
+# a personal name alone is not evidence of anything, an institutional address
+# under a title is.
+_AFFILIATION_RE = re.compile(
+    r"\b(?:university|universidade|institute|instituto|laborator(?:y|ies|io)|"
+    r"department of|dept\.? of|faculty of|school of|academy of|research (?:center|centre|group)|"
+    r"college of)\b",
+    re.IGNORECASE,
+)
+_CORRESPONDING_AUTHOR_RE = re.compile(
+    r"\b(?:corresponding author|e-?mail address|\*\s*corresponding)\b", re.IGNORECASE
+)
+
+# Marketing surface, kept separate from the presentation lexicon: these are the
+# words of an advertisement, and they are used as a *guard* for other families
+# rather than as standalone evidence for this one.
+_MARKETING_TERM_RE = re.compile(
+    r"\b(?:special offer|limited time|free trial|call (?:now|today)|order now|"
+    r"money[- ]back|discount|sale ends|buy (?:one|now)|satisfaction guaranteed|"
+    r"new and improved|advertisement)\b",
+    re.IGNORECASE,
+)
+
+# Specification vocabulary strong enough to be a guard. ``shall``/``must``
+# requirement language plus clause numbering is what an engineering
+# specification looks like regardless of whether it also has labelled fields.
+_SPEC_STRENGTH_RE = re.compile(
+    r"\b(?:shall (?:be|comply|conform|not|provide|have)|in accordance with|"
+    r"per (?:mil|ansi|astm|iso|ieee)[- ]?\w*|tolerance|specification no\.?|"
+    r"revision [a-z0-9]|drawing no\.?|part number)\b",
+    re.IGNORECASE,
+)
 
 
 # --------------------------------------------------------------------------
@@ -341,6 +407,108 @@ def _feature_fingerprint(features: dict[str, Any]) -> str:
         (f"{FEATURE_EXTRACTION_VERSION}\n" + "\n".join(keys)).encode("utf-8")
     ).hexdigest()
     return f"ff-{digest[:12]}"
+
+
+def feature_fingerprint(features: dict[str, Any]) -> str:
+    """The fingerprint a feature record *should* carry.
+
+    Public so that a consumer of a stored record can recompute it instead of
+    trusting the value stored beside it. The extraction version is inside the
+    digest, so a redefined feature invalidates the fingerprint even when the
+    emitted key set is unchanged.
+    """
+    if not isinstance(features, dict):
+        raise TypeError("features must be a dict")
+    return _feature_fingerprint({key: value for key, value in features.items() if key != "feature_fingerprint"})
+
+
+class FeatureContractError(ValueError):
+    """A stored feature record cannot be scored by this classifier."""
+
+
+def validate_feature_record(features: Any, *, source: str = "features") -> dict[str, Any]:
+    """Refuse feature records this classifier cannot score.
+
+    Stale cached features are the quietest failure in the whole pipeline: they
+    score, they produce a number, and nothing in the output says the number
+    describes a different feature definition than the one being reported. So
+    every incompatibility is an error here, never a coercion.
+
+    Returns the record's version descriptor, which the caller can use to
+    detect a *mixture* of versions across a corpus — equally silent, equally
+    fatal to comparability.
+    """
+    if not isinstance(features, dict):
+        raise FeatureContractError(f"{source}: feature record must be a dict")
+
+    schema_version = features.get("schema_version")
+    if schema_version not in SUPPORTED_FEATURE_SCHEMA_VERSIONS:
+        raise FeatureContractError(
+            f"{source}: incompatible schema_version {schema_version!r}; "
+            f"this classifier reads {sorted(SUPPORTED_FEATURE_SCHEMA_VERSIONS)}"
+        )
+    taxonomy_version = features.get("taxonomy_version")
+    if taxonomy_version != TAXONOMY_VERSION:
+        raise FeatureContractError(
+            f"{source}: features carry taxonomy_version {taxonomy_version!r}, "
+            f"classifier is {TAXONOMY_VERSION!r}"
+        )
+    extraction_version = features.get("feature_extraction_version")
+    if extraction_version != FEATURE_EXTRACTION_VERSION:
+        raise FeatureContractError(
+            f"{source}: features were extracted by feature_extraction_version "
+            f"{extraction_version!r}, classifier expects {FEATURE_EXTRACTION_VERSION!r}; "
+            "re-extract from document, page_sizes, page_words and provenance"
+        )
+    stored = features.get("feature_fingerprint")
+    expected = feature_fingerprint(features)
+    if stored != expected:
+        raise FeatureContractError(
+            f"{source}: feature_fingerprint {stored!r} does not match the record "
+            f"(recomputed {expected!r}); the feature set was edited after extraction"
+        )
+    return {
+        "schema_version": schema_version,
+        "taxonomy_version": taxonomy_version,
+        "feature_extraction_version": extraction_version,
+        "feature_fingerprint": stored,
+    }
+
+
+def validate_rule_ids(rule_ids: Any, *, source: str = "rule_ids") -> tuple[str, ...]:
+    """Refuse rule identifiers this classifier does not declare.
+
+    A stored artifact naming a rule that no longer exists was produced by a
+    different rule set. Reading it as though the rule simply never fired turns
+    a version mismatch into a plausible-looking zero.
+    """
+    if isinstance(rule_ids, dict):
+        candidates = [str(key) for key in rule_ids]
+    elif isinstance(rule_ids, (list, tuple, set, frozenset)):
+        candidates = [str(item) for item in rule_ids]
+    else:
+        raise FeatureContractError(f"{source}: expected a collection of rule ids")
+    unknown = sorted(set(candidates) - set(RULE_IDS))
+    if unknown:
+        raise FeatureContractError(
+            f"{source}: rule id(s) absent from RULE_IDS: {', '.join(unknown)}"
+        )
+    return tuple(candidates)
+
+
+def classifier_versions() -> dict[str, Any]:
+    """Everything needed to reproduce a decision, in one block."""
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "taxonomy_version": TAXONOMY_VERSION,
+        "feature_extraction_version": FEATURE_EXTRACTION_VERSION,
+        "classifier_version": CLASSIFIER_VERSION,
+        "rule_fingerprint": RULE_FINGERPRINT,
+        "rule_count": len(RULE_IDS),
+        "decision_group_count": DECISION_GROUP_COUNT,
+        "family_confidence_thresholds": dict(FAMILY_CONFIDENCE_THRESHOLDS),
+        "taxonomy": taxonomy_descriptor(),
+    }
 
 
 def _overlap_over_smaller(first: list[float], second: list[float]) -> float:
@@ -666,6 +834,7 @@ def extract_classification_features(
     extracted = {
         "schema_version": SCHEMA_VERSION,
         "taxonomy_version": TAXONOMY_VERSION,
+        "feature_extraction_version": FEATURE_EXTRACTION_VERSION,
         "provenance": dict(provenance) if isinstance(provenance, dict) else {},
         "classification_text": text,
         "total_pages": total_pages,
@@ -732,6 +901,17 @@ def extract_classification_features(
         "numbered_heading_count": len(_NUMBERED_HEADING_RE.findall(text)),
         "year_range_count": len(_YEAR_RANGE_RE.findall(text)),
         "attribution_count": len(_ATTRIBUTION_RE.findall(text)),
+        "quote_mark_count": len(_QUOTE_RE.findall(text)),
+        # Academic surface split into structure and vocabulary. The two were
+        # previously only observable as one boolean each, which made it
+        # impossible to state "a heading, not merely the word" as a rule.
+        "academic_section_heading_count": len(_ACADEMIC_SECTION_HEADING_RE.findall(text)),
+        "academic_vocabulary_count": len(_ACADEMIC_SECTION_RE.findall(text)),
+        "affiliation_marker_count": len(_AFFILIATION_RE.findall(text)),
+        "corresponding_author_count": len(_CORRESPONDING_AUTHOR_RE.findall(text)),
+        "press_release_marker_count": len(_PRESS_RELEASE_RE.findall(text)),
+        "marketing_term_count": len(_MARKETING_TERM_RE.findall(text)),
+        "specification_strength_count": len(_SPEC_STRENGTH_RE.findall(text)),
     }
     extracted.update(
         extract_geometry_features(
@@ -772,6 +952,23 @@ class _Context:
             return float(self.features.get(key) or 0.0)
         except (TypeError, ValueError):
             return 0.0
+
+    def opt(self, key: str) -> float | None:
+        """A float that may legitimately be absent.
+
+        OCR-quality means are ``None`` when the channel produced no
+        measurement. Coercing that to ``0.0`` would read "no measurement" as
+        "worst possible quality", which is how an unmeasured document ends up
+        being treated as illegible.
+        """
+        value = self.features.get(key)
+        if value is None:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
 
 
 class RuleSpec(NamedTuple):
@@ -863,7 +1060,13 @@ _FINANCIAL_UNITS_RE = re.compile(
 _FORM_HEADING_RE = re.compile(
     r"\b(?:application|registration|request|survey|questionnaire) form\b", re.IGNORECASE
 )
-_QUESTIONNAIRE_RE = re.compile(r"\b(?:questionnaire|survey)\b", re.IGNORECASE)
+# ``questionnaire`` is specific enough anywhere on the page; ``survey`` is not —
+# it is an ordinary word in research papers and reports — so it only counts as a
+# heading: a short line that ends with it.
+_QUESTIONNAIRE_RE = re.compile(
+    r"\bquestionnaire\b|^[ \t]*[\w ,'()-]{0,40}\bsurvey\b[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 _PRESENTATION_TERM_RE = re.compile(
     r"\b(?:agenda|presentation|our products?|limited time|special offer)\b",
     re.IGNORECASE,
@@ -896,29 +1099,56 @@ RULES: tuple[RuleSpec, ...] = (
     _rule(
         "research_paper",
         "academic_section_headings",
-        lambda c: c.has(_ACADEMIC_SECTION_HEADING_RE),
+        lambda c: c.num("academic_section_heading_count") >= 1,
+        group="academic_sections",
+    ),
+    # Corroborating only, and no longer satisfiable by one generic word:
+    # "methods", "results", "study" and "report" occur in every kind of
+    # document, so a single occurrence is not evidence of anything. It is
+    # excluded from the family gate, so it can never open a decision on its own.
+    _rule(
+        "research_paper",
+        "academic_vocabulary",
+        lambda c: c.num("academic_vocabulary_count") >= 2,
         group="academic_sections",
     ),
     _rule(
         "research_paper",
-        "academic_vocabulary",
-        lambda c: c.has(_ACADEMIC_SECTION_RE),
-        group="academic_sections",
+        "editorial_dates",
+        lambda c: c.has(_EDITORIAL_DATES_RE),
+        group="editorial_metadata",
     ),
-    _rule("research_paper", "editorial_dates", lambda c: c.has(_EDITORIAL_DATES_RE)),
-    _rule("research_paper", "formula_layout", lambda c: c.flt("formula_density") >= 0.03),
-    # This remains a named group for compatibility, though its sole remaining
-    # member means replacement semantics are currently inert.
+    _rule(
+        "research_paper",
+        "authors_affiliations",
+        lambda c: c.num("affiliation_marker_count") >= 2
+        or (
+            c.num("affiliation_marker_count") >= 1
+            and c.num("corresponding_author_count") >= 1
+        ),
+        group="editorial_metadata",
+    ),
+    # The three typographic signals of an academic page are substitutable
+    # expressions of one observation, so they share a group and cannot be
+    # counted three times for a document that happens to be well typeset.
+    _rule(
+        "research_paper",
+        "formula_layout",
+        lambda c: c.flt("formula_density") >= 0.03,
+        group="academic_layout",
+    ),
     _rule(
         "research_paper",
         "two_column_layout",
         lambda c: c.flt("two_column_ratio") >= 0.5,
+        group="academic_layout",
         requires="layout",
     ),
     _rule(
         "research_paper",
         "justified_body",
         _typeset_body,
+        group="academic_layout",
         requires="geometry",
     ),
     # ---- technical report ----------------------------------------------
@@ -982,20 +1212,45 @@ RULES: tuple[RuleSpec, ...] = (
     _rule("form_structured", "form_heading", lambda c: c.has(_FORM_HEADING_RE)),
     _rule("form_structured", "questionnaire_heading", lambda c: c.has(_QUESTIONNAIRE_RE)),
     _rule("form_structured", "checkboxes", lambda c: c.num("checkbox_count") >= 2),
-    _rule("form_structured", "blank_fields", lambda c: c.num("blank_field_count") >= 2, group="labelled_blanks"),
-    _rule("form_structured", "field_labels", lambda c: c.num("field_label_count") >= 3, group="labelled_blanks"),
+    # ``blank_fields`` is primary evidence and ``field_labels`` is corroborating,
+    # so they are no longer substitutable members of one group: a printed form
+    # with both should score higher than one with labels alone, and the family
+    # gate must be able to tell the two apart.
+    _rule("form_structured", "blank_fields", lambda c: c.num("blank_field_count") >= 2),
+    _rule("form_structured", "field_labels", lambda c: c.num("field_label_count") >= 3),
     _rule(
         "form_structured",
         "short_field_regions",
         lambda c: c.num("text_region_count") >= 5
         and c.flt("average_words_per_text_region") <= 8.0,
     ),
+    # The three geometric expressions of a field layout share one group: they
+    # are the same observation seen through label-value spacing, tab stops and
+    # line regularity. None of them can open a decision — see FAMILY_GATES.
+    # The former broad ``field_grid`` rule (any repeated alignment columns) is
+    # deliberately *not* reintroduced: prose, tables and columned reports all
+    # satisfy it.
     _rule(
         "form_structured",
         "label_value_lines",
         lambda c: c.flt("label_value_line_ratio") >= 0.30,
-        # field_grid was removed; this sole member retains the group name for
-        # stable rule IDs, but replacement semantics are currently inert.
+        group="field_geometry",
+        requires="geometry",
+    ),
+    _rule(
+        "form_structured",
+        "tab_stop_alignment",
+        lambda c: c.num("tab_stop_count") >= 2
+        and (c.num("blank_field_count") >= 1 or c.num("field_label_count") >= 2),
+        group="field_geometry",
+        requires="geometry",
+    ),
+    _rule(
+        "form_structured",
+        "field_geometry_regularity",
+        lambda c: c.flt("body_wide_gap_line_ratio") >= 0.35
+        and c.flt("line_pitch_regularity") >= 0.55
+        and c.flt("narrative_line_ratio") <= 0.35,
         group="field_geometry",
         requires="geometry",
     ),
@@ -1021,22 +1276,59 @@ RULES: tuple[RuleSpec, ...] = (
         group="visual_page",
         requires="layout",
     ),
+    # "A short title over lists" — the slide shape. A title region is now
+    # required: list density with no title is a table of contents, an index, or
+    # an itemised form, none of which are presentations.
     _rule(
         "presentation_marketing",
         "bullet_layout",
         lambda c: not _tables_dominate(c)
         and c.flt("list_density") >= 0.15
-        and c.num("word_count") <= 180,
+        and c.num("word_count") <= 180
+        and c.flt("title_density") >= 0.02,
     ),
+    _rule(
+        "presentation_marketing",
+        "slide_structure",
+        lambda c: not _tables_dominate(c)
+        and c.flt("landscape_ratio") >= 0.5
+        and c.flt("title_density") >= 0.05
+        and (
+            c.flt("list_density") >= 0.08
+            or c.flt("average_words_per_text_region") <= 20.0
+        ),
+        requires="layout",
+    ),
+    # Positive visual evidence stated directly: a large share of the page is
+    # picture *and* the text that is there is not narrative. Sparse text alone
+    # is not part of this rule — that was the path by which a short or
+    # low-quality OCR of any document became a "presentation".
+    _rule(
+        "presentation_marketing",
+        "visual_dominance",
+        lambda c: not _tables_dominate(c)
+        and c.flt("picture_area_ratio") >= 0.25
+        and c.flt("narrative_line_ratio") <= 0.25,
+        group="visual_density",
+        requires="geometry",
+    ),
+    # Corroborating vocabulary. Excluded from the family gate: an "agenda" line
+    # or a "special offer" is not on its own a reason to call a scan a slide.
     _rule(
         "presentation_marketing",
         "presentation_terms",
         lambda c: not _tables_dominate(c) and c.has(_PRESENTATION_TERM_RE),
     ),
+    # Restricted: centred sparse text describes a title page, a handwritten
+    # note, a certificate and a failed OCR just as well as a slide, so it now
+    # requires the landscape or pictorial evidence that distinguishes them.
     _rule(
         "presentation_marketing",
         "sparse_centered",
-        lambda c: c.flt("centered_line_ratio") >= 0.30 and c.num("word_line_count") <= 25,
+        lambda c: c.flt("centered_line_ratio") >= 0.30
+        and c.num("word_line_count") <= 25
+        and (c.flt("landscape_ratio") >= 0.5 or c.num("relevant_picture_count") >= 1),
+        group="visual_density",
         requires="geometry",
     ),
     # ---- correspondence (letter / memo / e-mail) -------------------------
@@ -1075,18 +1367,37 @@ RULES: tuple[RuleSpec, ...] = (
     _rule("news_article", "byline", lambda c: c.has(_BYLINE_RE)),
     _rule("news_article", "dateline", lambda c: c.has(_DATELINE_RE)),
     _rule("news_article", "wire_service", lambda c: c.has(_WIRE_SERVICE_RE)),
-    _rule("news_article", "attribution_quotes", lambda c: c.num("attribution_count") >= 3),
+    # Attribution verbs without quotations are ordinary narrative verbs; a
+    # reported speech block is an attribution verb *and* a quotation.
+    _rule(
+        "news_article",
+        "attribution_quotes",
+        lambda c: c.num("attribution_count") >= 3 and c.num("quote_mark_count") >= 2,
+    ),
     _rule(
         "news_article",
         "multi_column_body",
         lambda c: c.flt("two_column_ratio") >= 0.5 and c.num("word_count") >= 200,
+        group="news_layout",
         requires="layout",
     ),
     _rule(
         "news_article",
         "justified_body",
         _typeset_body,
+        group="news_layout",
         requires="geometry",
+    ),
+    # Headline over a long running body: a titled region on a page whose body
+    # is narrative and neither tabular nor pictorial.
+    _rule(
+        "news_article",
+        "headline_body",
+        lambda c: c.flt("title_density") >= 0.02
+        and c.num("word_count") >= 250
+        and c.flt("table_area_ratio") < 0.25
+        and c.flt("picture_area_ratio") < 0.35,
+        requires="layout",
     ),
 )
 
@@ -1102,6 +1413,7 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     "research_paper.academic_section_headings": 0.16,
     "research_paper.academic_vocabulary": 0.05,
     "research_paper.editorial_dates": 0.22,
+    "research_paper.authors_affiliations": 0.14,
     "research_paper.formula_layout": 0.08,
     "research_paper.two_column_layout": 0.08,
     "research_paper.justified_body": 0.14,
@@ -1128,18 +1440,26 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     "financial_document.monthly_series": 0.18,
     "financial_document.numeric_table": 0.22,
     "financial_document.accounting_negatives": 0.10,
-    "form_structured.form_heading": 0.28,
+    # Primary evidence outweighs corroborating evidence by construction, so the
+    # score agrees with the gate instead of contradicting it: the previous
+    # weights made ``field_labels`` and ``label_value_lines`` — both
+    # corroborating — as heavy as a form heading.
+    "form_structured.form_heading": 0.30,
     "form_structured.questionnaire_heading": 0.26,
-    "form_structured.checkboxes": 0.22,
-    "form_structured.blank_fields": 0.18,
-    "form_structured.field_labels": 0.22,
-    "form_structured.short_field_regions": 0.10,
-    "form_structured.label_value_lines": 0.26,
+    "form_structured.checkboxes": 0.24,
+    "form_structured.blank_fields": 0.22,
+    "form_structured.field_labels": 0.12,
+    "form_structured.short_field_regions": 0.08,
+    "form_structured.label_value_lines": 0.14,
+    "form_structured.tab_stop_alignment": 0.10,
+    "form_structured.field_geometry_regularity": 0.08,
     "presentation_marketing.visual_layout": 0.22,
     "presentation_marketing.landscape_layout": 0.16,
+    "presentation_marketing.slide_structure": 0.18,
+    "presentation_marketing.visual_dominance": 0.16,
     "presentation_marketing.bullet_layout": 0.12,
-    "presentation_marketing.presentation_terms": 0.24,
-    "presentation_marketing.sparse_centered": 0.16,
+    "presentation_marketing.presentation_terms": 0.20,
+    "presentation_marketing.sparse_centered": 0.12,
     "correspondence.header_block": 0.30,
     "correspondence.salutation": 0.24,
     "correspondence.closing": 0.18,
@@ -1158,7 +1478,556 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     "news_article.attribution_quotes": 0.16,
     "news_article.multi_column_body": 0.16,
     "news_article.justified_body": 0.16,
+    "news_article.headline_body": 0.12,
 }
+
+
+
+#: How many of a family's strongest evidence groups constitute a sufficient
+#: case. The normalising denominator is the mass of that many groups, not the
+#: family's total mass: dividing by the total would make a family with many
+#: weak corroborating rules structurally unable to reach a decision on its two
+#: or three decisive ones. Raising this makes every family harder to accept.
+DECISION_GROUP_COUNT = 3
+
+
+# --------------------------------------------------------------------------
+# Family gates: declarative acceptance requirements and cross-family guards
+# --------------------------------------------------------------------------
+#
+# A gate answers a question a weighted sum cannot: *is this the kind of
+# evidence that may decide this family at all?* Negative weights were the
+# previous answer, and they are close to uninterpretable — a large negative
+# weight both suppresses the family and silently re-scales every score around
+# it, and no reader of the output can tell which of the two happened.
+#
+# A gate is data, not code: it names the rules that form each independent
+# evidence group, how many groups a decision needs, which rules are merely
+# corroborating, and which named guards veto the family outright. Adding a
+# family requirement means adding a row here, never a conditional inside the
+# scorer or the decision policy.
+
+
+class Blocker(NamedTuple):
+    """A named, reusable "this is another family" guard."""
+
+    name: str
+    predicate: Callable[[_Context], bool]
+    description: str
+
+
+def _invoice_evidence(ctx: _Context) -> bool:
+    signals = (
+        ctx.has(_INVOICE_RE),
+        ctx.has(_AMOUNT_DUE_RE),
+        ctx.has(_SUBTOTAL_RE) and ctx.has(_TOTAL_RE),
+        ctx.has(_BILLING_PARTY_RE),
+        ctx.num("currency_match_count") >= 3,
+    )
+    return sum(bool(signal) for signal in signals) >= 2
+
+
+def _technical_specification_evidence(ctx: _Context) -> bool:
+    return (
+        ctx.has(_TECH_REPORT_RE)
+        or ctx.num("specification_strength_count") >= 2
+        or (ctx.has(_REQUIREMENTS_RE) and ctx.num("numbered_heading_count") >= 2)
+    )
+
+
+def _news_reporting_evidence(ctx: _Context) -> bool:
+    markers = (ctx.has(_BYLINE_RE), ctx.has(_DATELINE_RE), ctx.has(_WIRE_SERVICE_RE))
+    if sum(bool(marker) for marker in markers) >= 2:
+        return True
+    return (
+        any(markers)
+        and ctx.num("attribution_count") >= 3
+        and ctx.num("quote_mark_count") >= 2
+    )
+
+
+def _resume_evidence(ctx: _Context) -> bool:
+    return ctx.has(_RESUME_HEADING_RE) or (
+        ctx.has(_EXPERIENCE_SECTION_RE) and ctx.has(_EDUCATION_SECTION_RE)
+    )
+
+
+def _budget_evidence(ctx: _Context) -> bool:
+    """A budget is a labelled grid of money, which is form-shaped but is not a form."""
+    return (ctx.num("accounting_term_count") >= 4 and ctx.num("numeric_token_count") >= 12) or (
+        ctx.has(_REPORTING_PERIOD_RE)
+        and ctx.num("accounting_term_count") >= 3
+        and ctx.num("currency_match_count") >= 2
+    )
+
+
+def _advertisement_evidence(ctx: _Context) -> bool:
+    return ctx.num("marketing_term_count") >= 2 or (
+        ctx.num("marketing_term_count") >= 1 and _visual_page(ctx)
+    )
+
+
+def _research_publication_evidence(ctx: _Context) -> bool:
+    groups = (
+        ctx.has(_ABSTRACT_RE) or ctx.has(_REFERENCES_RE),
+        ctx.num("doi_match_count") > 0 or ctx.num("citation_match_count") >= 2,
+        ctx.has(_EDITORIAL_DATES_RE) or ctx.num("affiliation_marker_count") >= 2,
+    )
+    return sum(bool(group) for group in groups) >= 2
+
+
+def _correspondence_evidence(ctx: _Context) -> bool:
+    return (
+        ctx.has(_MEMO_RE)
+        or ctx.num("correspondence_header_count") >= 2
+        or (ctx.has(_SALUTATION_RE) and ctx.has(_CLOSING_RE))
+    )
+
+
+def _form_evidence(ctx: _Context) -> bool:
+    return (ctx.has(_FORM_HEADING_RE) or ctx.has(_QUESTIONNAIRE_RE)) and (
+        ctx.num("checkbox_count") >= 2 or ctx.num("blank_field_count") >= 2
+    )
+
+
+def _press_release_evidence(ctx: _Context) -> bool:
+    """Press releases are news-shaped but are not journalism.
+
+    Whether they may be accepted as ``news_article`` is a taxonomy decision,
+    declared once as ``press_release_policy`` in
+    :mod:`tasks.document.rvl_cdip_eval`. Under the default, this guard is
+    active; under ``news_article`` it is inert.
+    """
+    if PRESS_RELEASE_POLICY != "not_news_article":
+        return False
+    return ctx.num("press_release_marker_count") >= 1
+
+
+def _sparse_or_low_quality_ocr(ctx: _Context) -> bool:
+    """Little text, or text the OCR is not confident about.
+
+    This is emphatically *not* evidence for any family. A handwritten page, a
+    dark scan and a failed binarisation all produce it, and the previous rule
+    set let it act as positive evidence for ``presentation_marketing`` because
+    slides also happen to be short. Used only as a guard.
+    """
+    sparse = ctx.num("word_count") <= 60 or ctx.num("alnum_character_count") <= 200
+    word_confidence = ctx.opt("word_confidence_mean")
+    layout_confidence = ctx.opt("layout_confidence_mean")
+    low_quality = (word_confidence is not None and word_confidence < 0.55) or (
+        layout_confidence is not None and layout_confidence < 0.35
+    )
+    if not (sparse or low_quality):
+        return False
+    return not _visual_page(ctx) and ctx.flt("landscape_ratio") < 0.5
+
+
+BLOCKERS: tuple[Blocker, ...] = (
+    Blocker("invoice_evidence", _invoice_evidence, "Billing document: at least two invoice signals."),
+    Blocker(
+        "technical_specification_evidence",
+        _technical_specification_evidence,
+        "Engineering specification: requirement language, clause numbering or spec identifiers.",
+    ),
+    Blocker(
+        "news_reporting_evidence",
+        _news_reporting_evidence,
+        "Journalistic reporting: two of byline/dateline/wire, or one plus reported speech.",
+    ),
+    Blocker("resume_evidence", _resume_evidence, "CV heading, or experience and education sections."),
+    Blocker("budget_evidence", _budget_evidence, "Accounting vocabulary over a dense numeric grid."),
+    Blocker("advertisement_evidence", _advertisement_evidence, "Marketing copy, or marketing copy on a visual page."),
+    Blocker(
+        "research_publication_evidence",
+        _research_publication_evidence,
+        "Two independent academic evidence groups.",
+    ),
+    Blocker(
+        "correspondence_evidence",
+        _correspondence_evidence,
+        "Memorandum heading, routing header block, or salutation with closing.",
+    ),
+    Blocker("form_evidence", _form_evidence, "Form or questionnaire heading over blanks or checkboxes."),
+    Blocker(
+        "press_release_evidence",
+        _press_release_evidence,
+        "Press-release markers; active only under press_release_policy=not_news_article.",
+    ),
+    Blocker(
+        "sparse_or_low_quality_ocr",
+        _sparse_or_low_quality_ocr,
+        "Short or low-confidence OCR with no visual evidence; never positive evidence.",
+    ),
+)
+
+BLOCKER_PREDICATES: dict[str, Blocker] = {blocker.name: blocker for blocker in BLOCKERS}
+
+
+class FamilyGate(NamedTuple):
+    """Declarative acceptance requirement for one family.
+
+    ``groups``
+        Independent evidence groups, ``(group_name, rule_names)``. Two rules in
+        the same group are two ways of seeing one thing and count once.
+    ``min_groups``
+        How many distinct groups must fire for the family to be decidable.
+    ``sufficient_rules``
+        Rules strong enough to satisfy the gate alone.
+    ``required_any_groups``
+        When non-empty, at least one of these groups must be among those that
+        fired, whatever ``min_groups`` says.
+    ``corroborating``
+        Rules that add score but can never open a decision.
+    ``blockers``
+        Named guards; any one of them firing vetoes the family outright.
+    ``confidence_threshold``
+        Optional family-specific operating point. Declared here, resolved by
+        :func:`resolve_family_thresholds`, and reported in the result. It is an
+        offset from the global threshold, never a replacement for it.
+    """
+
+    family: str
+    groups: tuple[tuple[str, tuple[str, ...]], ...]
+    min_groups: int
+    sufficient_rules: frozenset[str]
+    required_any_groups: frozenset[str]
+    corroborating: tuple[str, ...]
+    blockers: tuple[str, ...]
+    confidence_threshold: float | None
+    rationale: str
+
+
+FAMILY_GATES: tuple[FamilyGate, ...] = (
+    FamilyGate(
+        family="form_structured",
+        groups=(
+            ("form_heading", ("form_heading",)),
+            ("questionnaire_heading", ("questionnaire_heading",)),
+            ("checkboxes", ("checkboxes",)),
+            ("blank_fields", ("blank_fields",)),
+        ),
+        min_groups=2,
+        sufficient_rules=frozenset({"form_heading", "questionnaire_heading"}),
+        required_any_groups=frozenset(),
+        corroborating=(
+            "field_labels",
+            "short_field_regions",
+            "label_value_lines",
+            "tab_stop_alignment",
+            "field_geometry_regularity",
+        ),
+        blockers=(
+            "invoice_evidence",
+            "technical_specification_evidence",
+            "news_reporting_evidence",
+            "advertisement_evidence",
+            "budget_evidence",
+            "resume_evidence",
+        ),
+        confidence_threshold=None,
+        rationale=(
+            "One strong primary (a form or questionnaire heading) or two independent "
+            "primaries (checkboxes, blank fields). Labelled lines, short regions, tab "
+            "stops and geometric regularity corroborate only: every one of them is also "
+            "produced by invoices, specifications, budgets, resumes, advertisements and "
+            "columned news pages, which is where the family's false positives came from."
+        ),
+    ),
+    FamilyGate(
+        family="correspondence",
+        # Each signal is its own group: a salutation at the top of a page and a
+        # closing at the bottom are two independent observations, not two
+        # spellings of one. Grouping them cost exactly the coverage this family
+        # is meant to gain — an ordinary "Dear ... Sincerely" letter carrying no
+        # routing header fired one group and was refused.
+        groups=(
+            ("header_block", ("header_block",)),
+            ("email_markers", ("email_markers",)),
+            ("salutation", ("salutation",)),
+            ("closing", ("closing",)),
+            ("memo_heading", ("memo_heading",)),
+            ("letter_geometry", ("letter_geometry",)),
+            ("letter_body", ("letter_body",)),
+        ),
+        min_groups=2,
+        sufficient_rules=frozenset(),
+        required_any_groups=frozenset(),
+        corroborating=(),
+        blockers=("form_evidence", "news_reporting_evidence"),
+        confidence_threshold=0.50,
+        rationale=(
+            "Two independent signals accept, even when each is individually weak — a "
+            "salutation with a closing, or an e-mail marker with letter geometry, is a "
+            "letter. Coverage is bought with the family threshold declared here, not by "
+            "lowering the global threshold for every family. ``letter_body`` cannot "
+            "reach the bar on its own: it only fires when a primary signal is already "
+            "present, and a letter carrying nothing but a routing header and the shape "
+            "of a letter still scores below the family threshold."
+        ),
+    ),
+    FamilyGate(
+        family="research_paper",
+        groups=(
+            (
+                "academic_structure",
+                ("abstract_heading", "references_heading", "academic_section_headings"),
+            ),
+            ("citation_evidence", ("doi", "citations")),
+            ("editorial_metadata", ("editorial_dates", "authors_affiliations")),
+            ("academic_layout", ("two_column_layout", "justified_body", "formula_layout")),
+        ),
+        min_groups=2,
+        sufficient_rules=frozenset(),
+        required_any_groups=frozenset(),
+        corroborating=("academic_vocabulary",),
+        blockers=("news_reporting_evidence", "invoice_evidence", "form_evidence"),
+        confidence_threshold=None,
+        rationale=(
+            "Two independent groups: structure with citations, structure with editorial "
+            "metadata, or citations with academic layout. Generic vocabulary is "
+            "corroborating only, so 'results', 'method', 'study' or a bare date can never "
+            "decide the family."
+        ),
+    ),
+    FamilyGate(
+        family="news_article",
+        groups=(
+            ("journalistic_source", ("byline", "wire_service")),
+            ("dateline", ("dateline",)),
+            ("reported_speech", ("attribution_quotes",)),
+            ("news_layout", ("multi_column_body", "justified_body")),
+            ("headline_body", ("headline_body",)),
+        ),
+        min_groups=2,
+        sufficient_rules=frozenset(),
+        required_any_groups=frozenset({"journalistic_source", "dateline", "news_layout"}),
+        corroborating=(),
+        blockers=(
+            "research_publication_evidence",
+            "advertisement_evidence",
+            "form_evidence",
+            "correspondence_evidence",
+            "press_release_evidence",
+        ),
+        confidence_threshold=None,
+        rationale=(
+            "A byline, an attribution or a column count alone decides nothing: two groups "
+            "are required, one of which must be a journalistic source, a dateline or the "
+            "news layout. Guards keep scientific publications, advertisements, forms, "
+            "institutional correspondence and press releases out of the family."
+        ),
+    ),
+    FamilyGate(
+        family="presentation_marketing",
+        groups=(
+            ("visual_page", ("visual_layout", "landscape_layout")),
+            ("slide_structure", ("slide_structure",)),
+            ("title_with_lists", ("bullet_layout",)),
+            ("visual_density", ("visual_dominance", "sparse_centered")),
+        ),
+        min_groups=1,
+        sufficient_rules=frozenset(),
+        required_any_groups=frozenset(
+            {"visual_page", "slide_structure", "title_with_lists", "visual_density"}
+        ),
+        corroborating=("presentation_terms",),
+        blockers=("sparse_or_low_quality_ocr", "form_evidence", "invoice_evidence"),
+        confidence_threshold=None,
+        rationale=(
+            "Positive visual evidence is required: relevant pictures, a landscape slide "
+            "structure, a short title over lists, or high visual area against low "
+            "narrative density. Short text, sparse text and low-quality OCR are guards, "
+            "never evidence, so a handwritten page is not a presentation for having "
+            "little text on it."
+        ),
+    ),
+)
+
+GATED_FAMILIES: frozenset[str] = frozenset(gate.family for gate in FAMILY_GATES)
+
+#: Family-specific operating points, declared once and reported in every
+#: result. They are *offsets* from the global threshold (see
+#: :func:`resolve_family_thresholds`), so sweeping the global threshold still
+#: moves every family and the risk-coverage curve stays meaningful.
+FAMILY_CONFIDENCE_THRESHOLDS: dict[str, float] = {
+    gate.family: float(gate.confidence_threshold)
+    for gate in FAMILY_GATES
+    if gate.confidence_threshold is not None
+}
+
+
+def _validate_gate_configuration() -> None:
+    """Refuse to import a gate table that does not describe the rule set.
+
+    A gate naming a rule that no longer exists silently stops constraining the
+    family it was written for, which is the failure mode this check exists to
+    make impossible.
+    """
+    rules_by_family: dict[str, set[str]] = {}
+    for rule in RULES:
+        rules_by_family.setdefault(rule.family, set()).add(rule.name)
+    for gate in FAMILY_GATES:
+        known = rules_by_family.get(gate.family)
+        if not known:
+            raise ValueError(f"gate declared for unknown family {gate.family!r}")
+        grouped = [name for _group, names in gate.groups for name in names]
+        if len(grouped) != len(set(grouped)):
+            raise ValueError(f"{gate.family}: a rule appears in more than one gate group")
+        covered = set(grouped) | set(gate.corroborating)
+        unknown = sorted(covered - known)
+        if unknown:
+            raise ValueError(f"{gate.family}: gate references unknown rule(s) {unknown}")
+        uncovered = sorted(known - covered)
+        if uncovered:
+            raise ValueError(
+                f"{gate.family}: rule(s) {uncovered} are neither gate evidence nor "
+                "corroborating; every rule of a gated family must be classified"
+            )
+        overlap = sorted(set(grouped) & set(gate.corroborating))
+        if overlap:
+            raise ValueError(f"{gate.family}: rule(s) {overlap} are both primary and corroborating")
+        unknown_sufficient = sorted(gate.sufficient_rules - set(grouped))
+        if unknown_sufficient:
+            raise ValueError(
+                f"{gate.family}: sufficient rule(s) {unknown_sufficient} are not gate evidence"
+            )
+        group_names = {name for name, _rules in gate.groups}
+        unknown_required = sorted(gate.required_any_groups - group_names)
+        if unknown_required:
+            raise ValueError(f"{gate.family}: required group(s) {unknown_required} do not exist")
+        if gate.min_groups < 1 or gate.min_groups > len(gate.groups):
+            raise ValueError(f"{gate.family}: min_groups is outside the declared groups")
+        unknown_blockers = sorted(set(gate.blockers) - set(BLOCKER_PREDICATES))
+        if unknown_blockers:
+            raise ValueError(f"{gate.family}: unknown blocker(s) {unknown_blockers}")
+
+
+_validate_gate_configuration()
+
+
+def evaluate_family_gates(
+    features: dict,
+    indicators: dict[str, bool],
+) -> dict[str, dict]:
+    """Evaluate every declared gate into an auditable per-family record.
+
+    Pure and separate from scoring: the returned record says *why* a family may
+    or may not be decided, and :func:`classify_with_rules` is the only place
+    that acts on it.
+    """
+    ctx = _Context(features)
+    channels = available_channels(features)
+    report: dict[str, dict] = {}
+    for gate in FAMILY_GATES:
+        fired_groups: list[str] = []
+        fired_rules: list[str] = []
+        for group_name, rule_names in gate.groups:
+            hits = [name for name in rule_names if indicators.get(f"{gate.family}.{name}")]
+            if hits:
+                fired_groups.append(group_name)
+                fired_rules.extend(hits)
+        sufficient = sorted(
+            name for name in gate.sufficient_rules if indicators.get(f"{gate.family}.{name}")
+        )
+        corroborating = sorted(
+            name for name in gate.corroborating if indicators.get(f"{gate.family}.{name}")
+        )
+        blocked_by = []
+        for name in gate.blockers:
+            blocker = BLOCKER_PREDICATES[name]
+            try:
+                if blocker.predicate(ctx):
+                    blocked_by.append(name)
+            except Exception:  # a malformed feature must not abort classification
+                continue
+
+        meets_required = (
+            not gate.required_any_groups
+            or bool(gate.required_any_groups & set(fired_groups))
+        )
+        satisfied = bool(sufficient) or (
+            len(fired_groups) >= gate.min_groups and meets_required
+        )
+        if blocked_by:
+            status = "blocked"
+        elif satisfied:
+            status = "satisfied"
+        else:
+            status = "insufficient_evidence"
+        report[gate.family] = {
+            "status": status,
+            "required_group_count": gate.min_groups,
+            "fired_groups": fired_groups,
+            "fired_primary_rules": sorted(fired_rules),
+            "sufficient_rules_fired": sufficient,
+            "corroborating_fired": corroborating,
+            "required_any_groups": sorted(gate.required_any_groups),
+            "blocked_by": blocked_by,
+            "available_channels": sorted(channels),
+            "family_confidence_threshold": gate.confidence_threshold,
+            "rationale": gate.rationale,
+        }
+    return report
+
+
+def resolve_family_thresholds(
+    confidence_threshold: float,
+    overrides: dict[str, float] | None = None,
+) -> dict[str, float]:
+    """Turn declared family thresholds into thresholds at this operating point.
+
+    A declared family threshold is an operating point stated *relative to the
+    module default*: it is applied as the same offset wherever the global
+    threshold is moved. That is what keeps a swept risk-coverage curve honest —
+    an absolute family threshold would sit still while the curve moved around
+    it, and the curve would then describe a policy nobody runs.
+    """
+    declared = FAMILY_CONFIDENCE_THRESHOLDS if overrides is None else overrides
+    global_threshold = float(confidence_threshold)
+    resolved: dict[str, float] = {}
+    for family, value in declared.items():
+        offset = float(value) - DEFAULT_CONFIDENCE_THRESHOLD
+        resolved[family] = round(max(0.0, global_threshold + offset), 6)
+    return resolved
+
+
+def _code_signature(code: CodeType) -> str:
+    """Deterministic rendering of a code object.
+
+    ``repr`` of a nested code object embeds its memory address, so hashing
+    ``co_consts`` directly produced a *different fingerprint on every process*
+    — the one thing a fingerprint must never do. Any predicate containing a
+    generator expression or a comprehension has such a nested object, which is
+    most of them. Nested code is therefore rendered recursively.
+    """
+    parts = [str(code.co_argcount), code.co_code.hex()]
+    for const in code.co_consts:
+        if isinstance(const, CodeType):
+            parts.append(f"<code:{_code_signature(const)}>")
+        else:
+            parts.append(repr(const))
+    parts.append(",".join(code.co_names))
+    parts.append(",".join(code.co_varnames))
+    return "|".join(parts)
+
+
+def _definition_signature(value: Any) -> str | None:
+    """Identity of one definition a rule depends on.
+
+    Source is preferred over bytecode: it is stable across interpreter
+    versions, so a fingerprint does not change merely because the benchmark ran
+    on a different Python. Bytecode is the fallback for definitions whose
+    source is unavailable.
+    """
+    if isinstance(value, re.Pattern):
+        return f"re:{value.pattern!r}/{value.flags}"
+    if callable(value) and hasattr(value, "__code__"):
+        try:
+            source = inspect.getsource(value)
+        except (OSError, TypeError, IndexError):
+            return f"code:{_code_signature(value.__code__)}"
+        return f"src:{' '.join(source.split())}"
+    return None
 
 
 def _rule_fingerprint() -> str:
@@ -1166,25 +2035,42 @@ def _rule_fingerprint() -> str:
     for rule in RULES:
         weight = float(DEFAULT_WEIGHTS.get(rule.rule_id, 0.0))
         predicate = rule.predicate
-        code = predicate.__code__
         referenced_definitions = []
-        for name in sorted(code.co_names):
-            value = predicate.__globals__.get(name)
-            if isinstance(value, re.Pattern):
-                referenced_definitions.append(f"{name}={value.pattern!r}/{value.flags}")
-            elif callable(value) and hasattr(value, "__code__"):
-                referenced_definitions.append(
-                    f"{name}={value.__code__.co_code!r}/{value.__code__.co_consts!r}"
-                )
+        for name in sorted(predicate.__code__.co_names):
+            signature = _definition_signature(predicate.__globals__.get(name))
+            if signature is not None:
+                referenced_definitions.append(f"{name}={signature}")
         parts.append(
             f"{rule.rule_id}|{rule.group}|{rule.requires}|{weight:.6f}|"
-            f"{code.co_code!r}|{code.co_consts!r}|{'|'.join(referenced_definitions)}"
+            f"{_definition_signature(predicate)}|{'|'.join(referenced_definitions)}"
         )
+    # Gates, family thresholds and the decision-group count are policy, and
+    # policy changes the classifier as surely as a weight does. They are part
+    # of the fingerprint so that two runs carrying the same fingerprint really
+    # did apply the same rules *and* the same acceptance requirements.
+    for gate in FAMILY_GATES:
+        parts.append(
+            f"gate:{gate.family}|{gate.groups}|{gate.min_groups}|"
+            f"{sorted(gate.sufficient_rules)}|{sorted(gate.required_any_groups)}|"
+            f"{gate.corroborating}|{gate.blockers}|{gate.confidence_threshold}"
+        )
+    for blocker in BLOCKERS:
+        parts.append(f"blocker:{blocker.name}|{_definition_signature(blocker.predicate)}")
+    parts.append(f"decision_group_count:{DECISION_GROUP_COUNT}")
+    parts.append(f"family_thresholds:{sorted(FAMILY_CONFIDENCE_THRESHOLDS.items())}")
+    parts.append(f"press_release_policy:{PRESS_RELEASE_POLICY}")
+    parts.append(f"scored_families:{list(SCORED_FAMILIES)}")
     digest = hashlib.sha1("\n".join(parts).encode("utf-8")).hexdigest()
     return digest[:12]
 
 
-CLASSIFIER_VERSION = f"rules-rvl-cdip-v4+{_rule_fingerprint()}"
+#: Identity of the rule set *and* of the policy applied to it. Any change to a
+#: rule, a weight, a gate, a blocker or a family threshold moves it.
+RULE_FINGERPRINT = _rule_fingerprint()
+
+#: v5: primary/corroborating separation, declarative family gates, per-family
+#: operating points.
+CLASSIFIER_VERSION = f"rules-rvl-cdip-v5+{RULE_FINGERPRINT}"
 
 
 def available_channels(features: dict) -> frozenset[str]:
@@ -1224,14 +2110,6 @@ def evaluate_rules(features: dict) -> dict[str, bool]:
         except Exception:  # a malformed feature must not abort classification
             indicators[rule.rule_id] = False
     return indicators
-
-
-#: How many of a family's strongest evidence groups constitute a sufficient
-#: case. The normalising denominator is the mass of that many groups, not the
-#: family's total mass: dividing by the total would make a family with many
-#: weak corroborating rules structurally unable to reach a decision on its two
-#: or three decisive ones. Raising this makes every family harder to accept.
-DECISION_GROUP_COUNT = 3
 
 
 def score_families(
@@ -1327,8 +2205,15 @@ def apply_decision_policy(
     min_score_margin: float,
     min_recognized_characters: int,
     mode: str,
+    family_thresholds: dict[str, float] | None = None,
 ) -> dict:
     """Turn a ranked score list into a decision.
+
+    ``family_thresholds`` is the resolved output of
+    :func:`resolve_family_thresholds`: a per-family operating point that
+    *replaces* the global threshold for the families that declare one, and is
+    reported alongside the decision as ``applied_confidence_threshold`` so no
+    reader has to infer which threshold was applied.
 
     Ranking, the threshold test and the margin all operate on the *unclipped*
     evidence ratio; only the reported ``confidence`` is clipped to ``[0, 1]``.
@@ -1343,72 +2228,80 @@ def apply_decision_policy(
     runner_up_family, runner_up_score = ranked[1] if len(ranked) > 1 else (None, 0.0)
     margin = round(top_score - runner_up_score, 4)
     reported = round(min(top_score, 1.0), 4)
+    resolved_thresholds = family_thresholds or {}
+    applied_threshold = float(
+        resolved_thresholds.get(top_family, confidence_threshold)
+    )
+
+    def _decision(payload: dict) -> dict:
+        """Every outcome reports the threshold it was actually judged against."""
+        return {"applied_confidence_threshold": round(applied_threshold, 6), **payload}
 
     if mode == "observe":
         # Full-coverage mode: no abstention, so the confusion matrix is complete
         # and the abstention policy can be evaluated separately from the rules.
         if top_score <= 0.0:
-            return {
+            return _decision({
                 "document_family": "other",
                 "decision": "observed",
                 "reason": "no_rules_matched",
                 "confidence": 0.0,
                 "score": top_score,
                 "score_margin": margin,
-            }
-        return {
+            })
+        return _decision({
             "document_family": top_family,
             "decision": "observed",
             "reason": "argmax_without_abstention",
             "confidence": reported,
             "score": top_score,
             "score_margin": margin,
-        }
+        })
 
     if recognized_characters < int(min_recognized_characters):
-        return {
+        return _decision({
             "document_family": "other",
             "decision": "abstained",
             "reason": "insufficient_ocr_text",
             "confidence": 0.0,
             "score": top_score,
             "score_margin": margin,
-        }
+        })
     if top_score <= 0.0:
-        return {
+        return _decision({
             "document_family": "other",
             "decision": "fallback",
             "reason": "no_rules_matched",
             "confidence": 0.0,
             "score": 0.0,
             "score_margin": margin,
-        }
-    if top_score < float(confidence_threshold):
-        return {
+        })
+    if top_score < applied_threshold:
+        return _decision({
             "document_family": "other",
             "decision": "fallback",
             "reason": "score_below_threshold",
             "confidence": reported,
             "score": top_score,
             "score_margin": margin,
-        }
+        })
     if margin < float(min_score_margin):
-        return {
+        return _decision({
             "document_family": "other",
             "decision": "abstained",
             "reason": "ambiguous_rule_scores",
             "confidence": reported,
             "score": top_score,
             "score_margin": margin,
-        }
-    return {
+        })
+    return _decision({
         "document_family": top_family,
         "decision": "classified",
         "reason": "score_above_threshold",
         "confidence": reported,
         "score": top_score,
         "score_margin": margin,
-    }
+    })
 
 
 def classify_with_rules(
@@ -1449,11 +2342,26 @@ def classify_with_rules(
 
     indicators = evaluate_rules(features)
     breakdown = score_families(features, indicators, weights)
+    gates = evaluate_family_gates(features, indicators)
+
+    # A gate that is not satisfied removes the family from contention: its
+    # evidence exists but is not of a kind that may decide the family. The
+    # pre-gate score is retained for error analysis, and the gated score is the
+    # one that ranks, that is reported as ``candidate_scores``, and that a
+    # risk-coverage replay re-reads — so the curve describes the policy that
+    # actually ran. Gates apply in every mode, including ``observe``: they are
+    # part of what counts as evidence, not part of the rejection policy.
+    pre_gate_scores = {family: entry["score"] for family, entry in breakdown.items()}
+    for family, entry in breakdown.items():
+        gate = gates.get(family)
+        if gate is not None and gate["status"] != "satisfied":
+            entry["score"] = 0.0
 
     ranked = sorted(
         ((family, entry["score"]) for family, entry in breakdown.items()),
         key=lambda item: (-item[1], item[0]),
     )
+    family_thresholds = resolve_family_thresholds(confidence_threshold)
     decision = apply_decision_policy(
         ranked,
         int(features.get("alnum_character_count") or 0),
@@ -1461,6 +2369,7 @@ def classify_with_rules(
         min_score_margin,
         min_recognized_characters,
         mode,
+        family_thresholds,
     )
 
     top_family, top_score = ranked[0]
@@ -1473,7 +2382,12 @@ def classify_with_rules(
     result = {
         "schema_version": SCHEMA_VERSION,
         "taxonomy_version": TAXONOMY_VERSION,
+        "feature_extraction_version": features.get("feature_extraction_version"),
         "classifier_version": CLASSIFIER_VERSION,
+        # The two identities a stored result needs to be reproducible: which
+        # rules and policy produced it, and which feature definitions it read.
+        "rule_fingerprint": RULE_FINGERPRINT,
+        "feature_fingerprint": features.get("feature_fingerprint"),
         "classifier": "rules",
         "mode": mode,
         "provenance": features.get("provenance") or {},
@@ -1496,6 +2410,19 @@ def classify_with_rules(
             family: entry["available_mass"] for family, entry in sorted(breakdown.items())
         },
         "evidence": {
+            # Why each gated family could or could not be decided. This is the
+            # auditable half of the gate: the score alone cannot say whether a
+            # family was out of contention for lack of evidence or because a
+            # guard vetoed it.
+            "family_gates": gates,
+            "pre_gate_scores": {
+                family: score for family, score in sorted(pre_gate_scores.items())
+            },
+            "gated_families": sorted(
+                family
+                for family, gate in gates.items()
+                if gate["status"] != "satisfied" and pre_gate_scores.get(family, 0.0) > 0.0
+            ),
             # Fired rules for every family, not only the winner: error analysis
             # needs to see what the losing families had.
             "rules_by_family": {
@@ -1540,6 +2467,12 @@ def classify_with_rules(
         },
         "thresholds": {
             "confidence": float(confidence_threshold),
+            # Declared per-family operating points, resolved at this global
+            # threshold. Exposed so that a lower bar for one family is visible
+            # in the output rather than hidden in the module.
+            "family_confidence": family_thresholds,
+            "declared_family_confidence": dict(FAMILY_CONFIDENCE_THRESHOLDS),
+            "applied_confidence": decision["applied_confidence_threshold"],
             "minimum_score_margin": float(min_score_margin),
             "minimum_recognized_characters": int(min_recognized_characters),
         },
