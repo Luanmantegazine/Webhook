@@ -19,25 +19,23 @@ Documented mapping decisions
     Settled. RVL-CDIP's "scientific publication" class is the peer-reviewed
     article: abstract, references, citations, two-column typesetting.
 
-``scientific report -> technical_report`` (default) *or* ``research_paper``
-    **Not settled.** RVL-CDIP's "scientific report" class mixes laboratory and
-    institutional reports (closer to ``technical_report``) with preprint-shaped
-    documents (closer to ``research_paper``). The choice is a taxonomy
-    decision, not a rule-quality question, so it is declared here, exposed in
-    every report through :func:`taxonomy_descriptor`, and configurable in one
-    place via ``scientific_report_family`` in the taxonomy config file. The
-    default preserves the mapping shipped so far; changing it changes ground
-    truth and therefore every metric that depends on it.
+``scientific report -> technical_report``
+    **Accepted in v6.** RVL-CDIP's "scientific report" class mixes laboratory
+    and institutional reports with preprint-shaped documents; the institutional
+    reading was selected and is now the ground truth the benchmark is measured
+    against, rather than an open question carried alongside the numbers. It
+    remains configurable in one place — ``scientific_report_family`` — because
+    reversing it is a legitimate future decision, but it is no longer pending:
+    results before and after any change must not be pooled.
 
-``press release -> (no RVL-CDIP class)``
-    RVL-CDIP has no press-release class, but press releases do appear inside
-    the news-article and correspondence classes and carry news-shaped surface
-    signals (dateline, attribution quotes, wire-service names). Whether a press
-    release should be accepted as ``news_article`` is a taxonomy decision, so it
-    is declared here as ``press_release_policy`` and consumed by exactly one
-    classifier gate. The default, ``not_news_article``, treats press-release
-    markers as a blocker for ``news_article`` — an institutional announcement
-    is not journalism.
+``press release -> not news_article``
+    **Accepted in v6.** RVL-CDIP has no press-release class, but press releases
+    appear inside the news-article and correspondence classes and carry
+    news-shaped surface signals (dateline, attribution quotes, wire-service
+    names). The selected policy, ``not_news_article``, treats press-release
+    markers as a blocker for ``news_article``: an institutional announcement is
+    not journalism. Unlike the mapping above this changes only a gate, never a
+    label, so it does not move ground truth.
 
 Rejection targets
 -----------------
@@ -184,27 +182,32 @@ CLASS_TO_FAMILY: dict[str, str] = dict(
     sorted({**_SETTLED_LABEL_MAPPING, "scientific report": SCIENTIFIC_REPORT_FAMILY}.items())
 )
 
-#: Decisions that are declared but not settled. Reported verbatim so a reader
-#: of any benchmark output can see what is still open.
-PENDING_TAXONOMY_DECISIONS: tuple[dict[str, Any], ...] = (
+#: The taxonomy decisions and their status. Reported verbatim so a reader of
+#: any benchmark output can see which choices the numbers rest on. Both were
+#: accepted in v6: they are settled inputs to the benchmark, still configurable
+#: here, and any future change makes results incomparable across the change.
+TAXONOMY_DECISIONS: tuple[dict[str, Any], ...] = (
     {
         "decision": "scientific_report_family",
-        "status": "pending",
+        "status": "accepted",
         "selected": SCIENTIFIC_REPORT_FAMILY,
         "choices": list(SCIENTIFIC_REPORT_FAMILY_CHOICES),
         "affects": ["ground_truth"],
+        "accepted_in": "classifier v6",
         "note": (
             "RVL-CDIP 'scientific report' mixes institutional/laboratory reports with "
-            "preprint-shaped documents. Changing this changes ground truth, so metrics "
-            "computed under different selections must not be pooled."
+            "preprint-shaped documents. Accepted as technical_report. Changing this "
+            "changes ground truth, so metrics computed under different selections must "
+            "not be pooled."
         ),
     },
     {
         "decision": "press_release_policy",
-        "status": "pending",
+        "status": "accepted",
         "selected": PRESS_RELEASE_POLICY,
         "choices": list(PRESS_RELEASE_POLICY_CHOICES),
         "affects": ["news_article_gate"],
+        "accepted_in": "classifier v6",
         "note": (
             "RVL-CDIP has no press-release class. Under 'not_news_article' press-release "
             "markers block the news_article gate; under 'news_article' they do not."
@@ -275,7 +278,10 @@ def taxonomy_descriptor() -> dict[str, Any]:
         "label_mapping": dict(CLASS_TO_FAMILY),
         "scientific_report_family": SCIENTIFIC_REPORT_FAMILY,
         "press_release_policy": PRESS_RELEASE_POLICY,
-        "pending_decisions": [dict(item) for item in PENDING_TAXONOMY_DECISIONS],
+        "decisions": [dict(item) for item in TAXONOMY_DECISIONS],
+        "pending_decisions": [
+            dict(item) for item in TAXONOMY_DECISIONS if item["status"] == "pending"
+        ],
     }
 
 

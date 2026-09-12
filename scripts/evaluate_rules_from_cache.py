@@ -55,8 +55,11 @@ from tasks.document.rules_classifier_core import (  # noqa: E402
     DEFAULT_MIN_SCORE_MARGIN,
     DOCUMENT_FAMILIES,
     FAMILY_CONFIDENCE_THRESHOLDS,
+    FAMILY_THRESHOLD_HOLDS,
+    FAMILY_THRESHOLD_PROVENANCE,
     FEATURE_EXTRACTION_VERSION,
     FeatureContractError,
+    SCORED_FAMILIES,
     RULE_FINGERPRINT,
     RULE_IDS,
     SCHEMA_VERSION,
@@ -64,6 +67,7 @@ from tasks.document.rules_classifier_core import (  # noqa: E402
     available_channels,
     apply_decision_policy,
     classifier_versions,
+    effective_family_threshold,
     classify_with_rules,
     extract_classification_features,
     resolve_family_thresholds,
@@ -90,6 +94,8 @@ PAGE_WORDS_PATH_COLUMN = "page_words_path"
 FEATURES_PATH_COLUMN = "classification_features_path"
 PROVENANCE_PATH_COLUMN = "provenance_path"
 VERSION_PREDICTION_COLUMNS = [
+    "effective_family_threshold",
+    "global_confidence_threshold",
     "schema_version",
     "taxonomy_version",
     "feature_extraction_version",
@@ -99,6 +105,7 @@ VERSION_PREDICTION_COLUMNS = [
     "feature_source",
     "applied_confidence_threshold",
     "family_gate_status",
+    "family_gate_reason",
     "gated_families",
 ]
 SPLIT_COLUMNS = ("source_manifest_split", "source_split", "split")
@@ -128,6 +135,14 @@ GEOMETRY_PREDICTION_COLUMNS = [
     "word_line_count",
     "right_edge_regularity",
     "two_column_ratio",
+    # v6: the features the presentation diagnosis turns on. Reading the v5
+    # false accepts required joining predictions back to the feature cache,
+    # which is exactly the kind of step that does not get taken.
+    "narrative_line_ratio",
+    "picture_area_ratio",
+    "relevant_picture_count",
+    "table_area_ratio",
+    "landscape_ratio",
 ]
 PREDICTION_CSV_HEADERS = [
     "sample_id", "rvl_label", "target_family", "source_target_family", "target_kind",
@@ -139,17 +154,39 @@ PREDICTION_CSV_HEADERS = [
 ] + VERSION_PREDICTION_COLUMNS + GEOMETRY_PREDICTION_COLUMNS
 REVIEW_CSV_HEADERS = [
     "sample_id", "rvl_label", "target_family", "source_target_family", "target_kind",
-    "rejection_label", "predicted_family", "correct", "decision", "reason", "confidence",
-    "score_margin", "top_candidate", "runner_up", "fired_rules", "review_rank",
+    "rejection_label", "predicted_family",
+    # v6: ``correct`` was one column answering three different questions, so a
+    # rejection target that was wrongly accepted and an out-of-scope document
+    # that was correctly routed both read as "False" and sorted together.
+    "canonical_correct", "scope_correct", "is_unsafe_accept", "is_rejection_false_accept",
+    "review_priority", "review_priority_label",
+    "decision", "reason", "confidence", "score", "effective_family_threshold",
+    "score_margin", "top_candidate", "runner_up", "gate_status", "gate_reason",
+    "fired_rules", "review_rank",
 ]
 FAMILY_RISK_COVERAGE_CSV_HEADERS = [
-    "target_family", "confidence_threshold", "min_score_margin",
+    "target_family", "confidence_threshold", "effective_family_threshold",
+    "min_score_margin",
     "min_recognized_characters", "classification_mode", "is_selected_operating_point",
     "positive_count", "negative_count", "negative_other_target_count",
-    "negative_control_count", "included_sample_count",
-    "excluded_rejection_target_count",
+    "negative_control_count", "negative_rejection_count", "included_sample_count",
     "accepted_count", "true_positive_count", "false_positive_count",
+    "rejection_false_accept_count",
     "coverage", "precision", "risk",
+]
+PER_LABEL_CSV_HEADERS = [
+    "rvl_label", "target_family", "target_kind", "sample_count", "accepted_count",
+    "coverage", "canonical_correct_count", "accepted_correct_count",
+    "accepted_routing_accuracy", "unsafe_accept_count", "unsafe_accept_rate",
+    "top_predicted_families", "top_reasons",
+]
+ROUTING_CSV_HEADERS = [
+    "family", "effective_family_threshold", "true_target_count",
+    "top_candidate_true_positive_count", "top_candidate_false_positive_count",
+    "top_candidate_precision", "top_candidate_recall",
+    "accepted_true_positive_count", "accepted_false_positive_count",
+    "accepted_false_negative_count", "accepted_precision", "accepted_recall",
+    "accepted_rejection_false_accept_count",
 ]
 CONFUSION_CSV_HEADERS = [
     "target_family", "source_target_families", "predicted_family", "error_count",
@@ -367,6 +404,37 @@ def _is_correct_rejection_decision(record: dict[str, Any]) -> bool:
     return record.get("decision") in {"abstained", "fallback"}
 
 
+def _is_accepted(record: dict[str, Any]) -> bool:
+    return record.get("decision") in ACCEPTED_DECISIONS
+
+
+def _is_rejection_false_accept(record: dict[str, Any]) -> bool:
+    """A document the classifier was supposed to decline, and did not.
+
+    The most expensive error in the taxonomy: a file folder or a handwritten
+    page routed to a family is a document sent somewhere it does not belong,
+    with a confidence attached.
+    """
+    return _is_rejection_target(record) and _is_accepted(record)
+
+
+def _is_accepted_wrong_family(record: dict[str, Any]) -> bool:
+    """An accepted answer that names the wrong family."""
+    if _is_rejection_target(record) or not _is_accepted(record):
+        return False
+    return record.get("predicted_family") != record.get("target_family")
+
+
+def _is_unsafe_accept(record: dict[str, Any]) -> bool:
+    """Any accepted decision that is wrong.
+
+    Unsafe accepts are the number a deployment cares about: a refusal costs
+    coverage, an unsafe accept costs trust. Kept distinct from "not correct",
+    which also counts refusals.
+    """
+    return _is_rejection_false_accept(record) or _is_accepted_wrong_family(record)
+
+
 def _record_is_correct(record: dict[str, Any], target_families: frozenset[str] | None = None) -> bool:
     if _is_rejection_target(record):
         return _is_correct_rejection_decision(record)
@@ -446,6 +514,177 @@ def _classified_metrics(
         "per_class": per_class,
         "confusion_matrix": confusion,
     }
+
+
+def _routing_metrics(
+    records: list[dict[str, Any]],
+    confidence_threshold: float,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Routing quality for every scorable family.
+
+    v5 reported detection metrics only for the four scoped families, so the
+    families nobody was scoping — the ones quietly absorbing other families'
+    documents — had no precision number anywhere in the report. Every scorable
+    family is measured here, with rejection targets included as negatives:
+    accepting a file folder as ``financial_document`` is a false positive for
+    ``financial_document``, and excluding it from that family's denominator is
+    how it stayed invisible.
+    """
+    classifier_eligible = [record for record in records if not _is_rejection_target(record)]
+    accepted = [record for record in records if _is_accepted(record)]
+    accepted_eligible = [record for record in accepted if not _is_rejection_target(record)]
+    accepted_correct = sum(
+        record["predicted_family"] == record["target_family"] for record in accepted_eligible
+    )
+    accepted_wrong_family_count = sum(_is_accepted_wrong_family(record) for record in records)
+    rejection_false_accept_count = sum(_is_rejection_false_accept(record) for record in records)
+    unsafe_accept_count = accepted_wrong_family_count + rejection_false_accept_count
+
+    per_family: dict[str, Any] = {}
+    csv_rows: list[dict[str, Any]] = []
+    for family in SCORED_FAMILIES:
+        threshold = effective_family_threshold(family, confidence_threshold)
+        support = sum(record["target_family"] == family for record in classifier_eligible)
+        top_tp = sum(
+            record["target_family"] == family and record.get("top_candidate") == family
+            for record in classifier_eligible
+        )
+        top_fp = sum(
+            record["target_family"] != family and record.get("top_candidate") == family
+            for record in records
+        )
+        accepted_tp = sum(
+            not _is_rejection_target(record)
+            and record["target_family"] == family
+            and _is_accepted(record)
+            and record["predicted_family"] == family
+            for record in records
+        )
+        accepted_fp = sum(
+            _is_accepted(record)
+            and record["predicted_family"] == family
+            and (_is_rejection_target(record) or record["target_family"] != family)
+            for record in records
+        )
+        accepted_fn = sum(
+            not _is_rejection_target(record)
+            and record["target_family"] == family
+            and not (_is_accepted(record) and record["predicted_family"] == family)
+            for record in records
+        )
+        rejection_fp = sum(
+            _is_rejection_false_accept(record) and record["predicted_family"] == family
+            for record in records
+        )
+        row = {
+            "family": family,
+            "effective_family_threshold": threshold,
+            "true_target_count": support,
+            "top_candidate_true_positive_count": top_tp,
+            "top_candidate_false_positive_count": top_fp,
+            "top_candidate_precision": round(_safe_ratio(top_tp, top_tp + top_fp), 4),
+            "top_candidate_recall": round(_safe_ratio(top_tp, support), 4),
+            "accepted_true_positive_count": accepted_tp,
+            "accepted_false_positive_count": accepted_fp,
+            "accepted_false_negative_count": accepted_fn,
+            "accepted_precision": round(_safe_ratio(accepted_tp, accepted_tp + accepted_fp), 4),
+            "accepted_recall": round(_safe_ratio(accepted_tp, accepted_tp + accepted_fn), 4),
+            "accepted_rejection_false_accept_count": rejection_fp,
+        }
+        per_family[family] = {key: value for key, value in row.items() if key != "family"}
+        csv_rows.append(row)
+
+    payload = {
+        "definition": (
+            "Routing quality over every scorable family. Positives are documents whose "
+            "canonical target is the family; negatives are every other document "
+            "including rejection targets, so accepting a file folder counts against the "
+            "family that accepted it."
+        ),
+        "families": list(SCORED_FAMILIES),
+        "accepted_count": len(accepted),
+        "accepted_classifier_eligible_count": len(accepted_eligible),
+        "accepted_routing_accuracy": round(
+            _safe_ratio(accepted_correct, len(accepted_eligible)), 4
+        ),
+        "accepted_correct_count": accepted_correct,
+        "accepted_wrong_family_count": accepted_wrong_family_count,
+        "rejection_false_accept_count": rejection_false_accept_count,
+        "unsafe_accept_count": unsafe_accept_count,
+        "unsafe_accept_rate": round(_safe_ratio(unsafe_accept_count, len(accepted)), 4),
+        "unsafe_accept_definition": (
+            "An accepted decision (classified or observed) that names the wrong family, "
+            "plus every rejection target that was accepted at all."
+        ),
+        "per_family": per_family,
+    }
+    return payload, csv_rows
+
+
+def _per_rvl_label_metrics(records: list[dict[str, Any]]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Metrics per original RVL-CDIP label, not only per mapped family.
+
+    Three labels collapse onto ``correspondence`` and two onto each of several
+    other families, so a family-level number hides which *source class* the
+    classifier actually handles. A family at 70% built from one label at 100%
+    and another at 10% is not a family at 70%.
+    """
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        grouped.setdefault(_non_empty(record.get("rvl_label")) or "<unlabelled>", []).append(record)
+
+    payload: dict[str, Any] = {}
+    csv_rows: list[dict[str, Any]] = []
+    for label, rows in sorted(grouped.items()):
+        accepted = [record for record in rows if _is_accepted(record)]
+        is_rejection = bool(rows and _is_rejection_target(rows[0]))
+        canonical_correct = sum(_record_is_correct(record) for record in rows)
+        accepted_correct = sum(
+            not _is_rejection_target(record)
+            and record["predicted_family"] == record["target_family"]
+            for record in accepted
+        )
+        unsafe = sum(_is_unsafe_accept(record) for record in rows)
+        predicted = Counter(record["predicted_family"] for record in rows)
+        reasons = Counter(_non_empty(record.get("reason")) for record in rows if _non_empty(record.get("reason")))
+        entry = {
+            "target_family": rows[0]["target_family"],
+            "target_kind": rows[0]["target_kind"],
+            "sample_count": len(rows),
+            "accepted_count": len(accepted),
+            "coverage": round(_safe_ratio(len(accepted), len(rows)), 4),
+            "canonical_correct_count": canonical_correct,
+            "accepted_correct_count": accepted_correct,
+            "accepted_routing_accuracy": round(_safe_ratio(accepted_correct, len(accepted)), 4),
+            "unsafe_accept_count": unsafe,
+            "unsafe_accept_rate": round(_safe_ratio(unsafe, len(accepted)), 4),
+            "predicted_families": dict(sorted(predicted.items())),
+            "reasons": dict(sorted(reasons.items())),
+            "correct_criterion": (
+                "abstained or fallback" if is_rejection else "predicted_family == target_family"
+            ),
+        }
+        payload[label] = entry
+        csv_rows.append(
+            {
+                "rvl_label": label,
+                "target_family": entry["target_family"],
+                "target_kind": entry["target_kind"],
+                "sample_count": entry["sample_count"],
+                "accepted_count": entry["accepted_count"],
+                "coverage": entry["coverage"],
+                "canonical_correct_count": entry["canonical_correct_count"],
+                "accepted_correct_count": entry["accepted_correct_count"],
+                "accepted_routing_accuracy": entry["accepted_routing_accuracy"],
+                "unsafe_accept_count": entry["unsafe_accept_count"],
+                "unsafe_accept_rate": entry["unsafe_accept_rate"],
+                "top_predicted_families": "; ".join(
+                    f"{name}:{count}" for name, count in predicted.most_common(5)
+                ),
+                "top_reasons": "; ".join(f"{name}:{count}" for name, count in reasons.most_common(5)),
+            }
+        )
+    return payload, csv_rows
 
 
 def _scoped_detection_metrics(
@@ -623,6 +862,7 @@ def _scoped_detection_metrics(
 def _metrics(
     records: list[dict[str, Any]],
     target_families: frozenset[str] | None = None,
+    confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
 ) -> dict[str, Any]:
     scoped_target_families = frozenset(target_families or ())
     labels = sorted(scoped_target_families) if scoped_target_families else list(DOCUMENT_FAMILIES)
@@ -699,9 +939,20 @@ def _metrics(
             "thresholds and excludes rejection targets."
         )
 
+    routing, _routing_rows = _routing_metrics(records, confidence_threshold)
+    per_rvl_label, _label_rows = _per_rvl_label_metrics(records)
+
     result = {
         "metric_schema_version": METRIC_SCHEMA_VERSION,
         "sample_count": len(records),
+        # Promoted to the top level: these four answer "can an accepted answer
+        # be trusted", which no other block in this report answers directly.
+        "accepted_routing_accuracy": routing["accepted_routing_accuracy"],
+        "accepted_wrong_family_count": routing["accepted_wrong_family_count"],
+        "unsafe_accept_count": routing["unsafe_accept_count"],
+        "unsafe_accept_rate": routing["unsafe_accept_rate"],
+        "routing": routing,
+        "per_rvl_label": per_rvl_label,
         "classifier_eligible_sample_count": len(classifier_eligible_records),
         "rejection_target_count": len(rejection_records),
         "classification_coverage": {
@@ -911,7 +1162,11 @@ def _predict_samples(
         except FeatureContractError as error:
             raise VersionCompatibilityError(str(error)) from error
         gates = prediction.get("evidence", {}).get("family_gates", {}) or {}
-        predicted_family = prediction["document_family"]
+        # The gate to report is the one belonging to the family that was
+        # actually judged: on a refusal ``document_family`` is ``other``, which
+        # has no gate, and the interesting record is the family that was
+        # refused.
+        decided_family = prediction.get("top_candidate") or prediction["document_family"]
         in_scope_target, target_scope_status = _target_scope_status(
             is_rejection_target=sample.is_rejection_target,
             target_family=sample.target_family,
@@ -958,8 +1213,19 @@ def _predict_samples(
                     prediction.get("thresholds", {}).get("applied_confidence")
                 ),
                 "family_gate_status": (
-                    gates.get(predicted_family, {}).get("status", "not_gated")
+                    gates.get(decided_family, {}).get("status", "not_gated")
                 ),
+                "family_gate_reason": (
+                    gates.get(decided_family, {}).get("reason", "")
+                ),
+                # Reported beside — never instead of — the global threshold: a
+                # family judged at its own bar and reported under the global
+                # number is a lower bar that no table shows.
+                "effective_family_threshold": _coerce_float(
+                    prediction.get("thresholds", {}).get("effective_family_threshold"),
+                    confidence_threshold,
+                ),
+                "global_confidence_threshold": float(confidence_threshold),
                 "gated_families": prediction.get("evidence", {}).get("gated_families", []) or [],
                 "geometry_page_ratio": _coerce_float(sample.features.get("geometry_page_ratio")),
                 "geometry_pages": int(_coerce_float(sample.features.get("geometry_pages"))),
@@ -973,6 +1239,13 @@ def _predict_samples(
                 "word_line_count": int(_coerce_float(sample.features.get("word_line_count"))),
                 "right_edge_regularity": _coerce_float(sample.features.get("right_edge_regularity")),
                 "two_column_ratio": _coerce_float(sample.features.get("two_column_ratio")),
+                "narrative_line_ratio": _coerce_float(sample.features.get("narrative_line_ratio")),
+                "picture_area_ratio": _coerce_float(sample.features.get("picture_area_ratio")),
+                "relevant_picture_count": int(
+                    _coerce_float(sample.features.get("relevant_picture_count"))
+                ),
+                "table_area_ratio": _coerce_float(sample.features.get("table_area_ratio")),
+                "landscape_ratio": _coerce_float(sample.features.get("landscape_ratio")),
             }
         )
     return predictions
@@ -1010,8 +1283,12 @@ def _build_family_risk_coverage(
     classifier_eligible = [
         record for record in predictions if not _is_rejection_target(record)
     ]
-    curve_population = classifier_eligible
-    excluded_rejection_count = len(predictions) - len(classifier_eligible)
+    # v6: rejection targets are negatives, not exclusions. A curve computed
+    # without them reports a risk the deployment does not have — file folders
+    # and handwritten pages are exactly the documents that get accepted by a
+    # family with a low bar, and leaving them out of the denominator hides it.
+    curve_population = predictions
+    rejection_count = len(predictions) - len(classifier_eligible)
     ranked_scores = {
         id(record): _rank_stored_candidate_scores(record)
         for record in curve_population
@@ -1027,30 +1304,40 @@ def _build_family_risk_coverage(
     )
     curves = []
     csv_rows = []
-    for family in SCOPABLE_TARGET_FAMILIES:
+    scored_families = set(SCORED_FAMILIES)
+    for family in SCORED_FAMILIES:
         positives = [
-            record for record in curve_population if record.get("target_family") == family
+            record
+            for record in curve_population
+            if record.get("target_family") == family and not _is_rejection_target(record)
         ]
         other_target_negatives = [
             record
             for record in curve_population
-            if record.get("target_family") in set(SCOPABLE_TARGET_FAMILIES)
+            if not _is_rejection_target(record)
+            and record.get("target_family") in scored_families
             and record.get("target_family") != family
         ]
         control_negatives = [
             record
             for record in curve_population
-            if record.get("target_family") not in SCOPABLE_TARGET_FAMILIES
+            if not _is_rejection_target(record)
+            and record.get("target_family") not in scored_families
         ]
-        negative_count = len(other_target_negatives) + len(control_negatives)
+        rejection_negatives = [
+            record for record in curve_population if _is_rejection_target(record)
+        ]
+        negative_count = (
+            len(other_target_negatives) + len(control_negatives) + len(rejection_negatives)
+        )
         common = {
             "target_family": family,
             "positive_count": len(positives),
             "negative_count": negative_count,
             "negative_other_target_count": len(other_target_negatives),
             "negative_control_count": len(control_negatives),
+            "negative_rejection_count": len(rejection_negatives),
             "included_sample_count": len(curve_population),
-            "excluded_rejection_target_count": excluded_rejection_count,
         }
         points = []
         for threshold in thresholds:
@@ -1075,11 +1362,19 @@ def _build_family_risk_coverage(
                 ):
                     accepted_records.append(record)
             true_positives = sum(
-                record.get("target_family") == family for record in accepted_records
+                record.get("target_family") == family and not _is_rejection_target(record)
+                for record in accepted_records
             )
             false_positives = len(accepted_records) - true_positives
+            rejection_false_accepts = sum(
+                _is_rejection_target(record) for record in accepted_records
+            )
             point = {
                 "confidence_threshold": threshold,
+                # The bar this family was actually judged against at this point
+                # of the sweep, which is not the global threshold whenever the
+                # family declares its own.
+                "effective_family_threshold": swept_family_thresholds.get(family, threshold),
                 "min_score_margin": min_score_margin,
                 "min_recognized_characters": min_recognized_characters,
                 "classification_mode": classification_mode,
@@ -1087,6 +1382,7 @@ def _build_family_risk_coverage(
                 "accepted_count": len(accepted_records),
                 "true_positive_count": true_positives,
                 "false_positive_count": false_positives,
+                "rejection_false_accept_count": rejection_false_accepts,
                 "coverage": round(_safe_ratio(true_positives, len(positives)), 4),
                 "precision": round(_safe_ratio(true_positives, len(accepted_records)), 4),
                 "risk": round(_safe_ratio(false_positives, len(accepted_records)), 4),
@@ -1098,10 +1394,10 @@ def _build_family_risk_coverage(
     payload = {
         "schema_version": 1,
         "definition": (
-            "For each target family, positives have that canonical target_family; "
-            "negatives are the other three scoped target families plus controls, which are "
-            "all classifier-eligible documents outside the four scoped target families. "
-            "Rejection targets are excluded and reported separately. "
+            "For every scorable family, positives have that canonical target_family; "
+            "negatives are all other documents — the other scorable families, controls "
+            "outside them, and rejection targets, which are negatives for every family "
+            "because accepting one is always an error. "
             "Each point replays apply_decision_policy from stored candidate_scores only; "
             "it does not rerun OCR, feature extraction, or rule evaluation. Coverage is "
             "true-positive acceptance divided by positives; risk is false-positive "
@@ -1118,17 +1414,57 @@ def _build_family_risk_coverage(
             "min_recognized_characters": min_recognized_characters,
         },
         "population": {
-            "target_families": list(SCOPABLE_TARGET_FAMILIES),
+            "target_families": list(SCORED_FAMILIES),
             "included_sample_count": len(curve_population),
             "control_count": sum(
-                record.get("target_family") not in SCOPABLE_TARGET_FAMILIES
+                not _is_rejection_target(record)
+                and record.get("target_family") not in scored_families
                 for record in curve_population
             ),
-            "excluded_rejection_target_count": excluded_rejection_count,
+            "rejection_target_count": rejection_count,
         },
         "curves": curves,
     }
     return payload, csv_rows
+
+
+#: Review order. A reviewer's attention is the scarce resource, so the list is
+#: ordered by what an error *costs*, not by how confident the classifier was:
+#: a wrongly accepted rejection target is a document sent somewhere it does not
+#: belong, while a fallback with no rules is only a gap in coverage.
+REVIEW_PRIORITIES: tuple[tuple[int, str], ...] = (
+    (1, "rejection_target_accepted"),
+    (2, "accepted_wrong_family"),
+    (3, "high_confidence_false_positive"),
+    (4, "false_negative_near_threshold"),
+    (5, "fallback_without_rules"),
+    (6, "other"),
+)
+_HIGH_CONFIDENCE_FALSE_POSITIVE = 0.85
+_NEAR_THRESHOLD_BAND = 0.15
+
+
+def _review_priority(record: dict[str, Any], canonical_correct: bool) -> tuple[int, str]:
+    if _is_rejection_false_accept(record):
+        return REVIEW_PRIORITIES[0]
+    if _is_accepted_wrong_family(record):
+        # An accepted wrong answer given with high confidence is the same class
+        # of error but the more misleading one, so it is split out below by
+        # score rather than by being demoted here.
+        if _coerce_float(record.get("score")) >= _HIGH_CONFIDENCE_FALSE_POSITIVE:
+            return REVIEW_PRIORITIES[2]
+        return REVIEW_PRIORITIES[1]
+    if not canonical_correct and not _is_accepted(record):
+        threshold = _coerce_float(
+            record.get("effective_family_threshold"),
+            DEFAULT_CONFIDENCE_THRESHOLD,
+        )
+        score = _coerce_float(record.get("score"))
+        if record.get("reason") == "no_rules_matched":
+            return REVIEW_PRIORITIES[4]
+        if score > 0.0 and (threshold - score) <= _NEAR_THRESHOLD_BAND:
+            return REVIEW_PRIORITIES[3]
+    return REVIEW_PRIORITIES[5]
 
 
 def _build_ranked_review(
@@ -1136,10 +1472,24 @@ def _build_ranked_review(
     review_limit: int,
     target_families: frozenset[str] | None = None,
 ) -> list[dict[str, Any]]:
+    """Rank documents for human review.
+
+    v6 replaced the single ``correct`` column. It answered three questions at
+    once — canonical correctness, in-scope correctness, and whether a rejection
+    target had been declined — so a correctly routed out-of-scope document and
+    a wrongly accepted file folder both read ``False`` and sorted side by side.
+    Each question now has its own column, and the sort is by review priority.
+    """
     scoped_target_families = frozenset(target_families or ())
     ranked = []
     for record in predictions:
-        correct = _record_is_correct(record, scoped_target_families)
+        canonical_correct = _record_is_correct(record)
+        scope_correct = (
+            _record_is_correct(record, scoped_target_families)
+            if scoped_target_families
+            else canonical_correct
+        )
+        priority, priority_label = _review_priority(record, canonical_correct)
         fired_rule_names = [
             str(item.get("rule", ""))
             for item in record["rules_triggered"]
@@ -1154,21 +1504,32 @@ def _build_ranked_review(
                 "target_kind": record["target_kind"],
                 "rejection_label": record["rejection_label"],
                 "predicted_family": record["predicted_family"],
-                "correct": bool(correct),
+                "canonical_correct": bool(canonical_correct),
+                "scope_correct": bool(scope_correct),
+                "is_unsafe_accept": _is_unsafe_accept(record),
+                "is_rejection_false_accept": _is_rejection_false_accept(record),
+                "review_priority": priority,
+                "review_priority_label": priority_label,
                 "decision": record["decision"],
                 "reason": record["reason"],
                 "confidence": round(_coerce_float(record["confidence"]), 4),
+                "score": round(_coerce_float(record.get("score")), 4),
+                "effective_family_threshold": round(
+                    _coerce_float(record.get("effective_family_threshold")), 4
+                ),
                 "score_margin": round(_coerce_float(record["score_margin"]), 4),
                 "top_candidate": record.get("top_candidate"),
                 "runner_up": record.get("runner_up"),
+                "gate_status": record.get("family_gate_status", ""),
+                "gate_reason": record.get("family_gate_reason", ""),
                 "fired_rules": fired_rule_names,
             }
         )
 
     ranked.sort(
         key=lambda row: (
-            0 if not row["correct"] else 1,
-            row["score_margin"],
+            row["review_priority"],
+            -row["confidence"] if row["is_unsafe_accept"] else row["score_margin"],
             row["confidence"],
             row["sample_id"],
         )
@@ -1961,7 +2322,11 @@ def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         mode=args.classification_mode,
         target_families=scoped_target_families,
     )
-    metrics = _metrics(predictions, scoped_target_families)
+    metrics = _metrics(
+        predictions,
+        scoped_target_families,
+        confidence_threshold=selected_config["confidence_threshold"],
+    )
     metrics["input_errors"] = {
         "cached_manifest_input_errors": sum(
             1 for record in input_errors if record.error_source == "cached_manifest_input_error"
@@ -1984,6 +2349,8 @@ def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     input_errors_csv_path = output_directory / "manifest_input_errors.csv"
     family_risk_coverage_json_path = output_directory / "family_risk_coverage_curve.json"
     family_risk_coverage_csv_path = output_directory / "family_risk_coverage_curve.csv"
+    routing_csv_path = output_directory / "routing_by_family.csv"
+    per_label_csv_path = output_directory / "metrics_by_rvl_label.csv"
 
     prediction_rows_for_csv = [_serialize_prediction_for_csv(item) for item in predictions]
     _write_csv(predictions_path, prediction_rows_for_csv, PREDICTION_CSV_HEADERS)
@@ -2000,6 +2367,13 @@ def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         family_risk_coverage_rows,
         FAMILY_RISK_COVERAGE_CSV_HEADERS,
     )
+
+    _routing_payload, routing_rows = _routing_metrics(
+        predictions, selected_config["confidence_threshold"]
+    )
+    _per_label_payload, per_label_rows = _per_rvl_label_metrics(predictions)
+    _write_csv(routing_csv_path, routing_rows, ROUTING_CSV_HEADERS)
+    _write_csv(per_label_csv_path, per_label_rows, PER_LABEL_CSV_HEADERS)
 
     ranked_review = _build_ranked_review(
         predictions,
@@ -2034,6 +2408,8 @@ def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             selected_config["confidence_threshold"]
         ),
         "declared_family_confidence_thresholds": dict(FAMILY_CONFIDENCE_THRESHOLDS),
+        "family_threshold_provenance": dict(FAMILY_THRESHOLD_PROVENANCE),
+        "family_threshold_holds": dict(FAMILY_THRESHOLD_HOLDS),
         "min_score_margin": selected_config["min_score_margin"],
         "min_recognized_characters": selected_config["min_recognized_characters"],
         "calibrate_validation": bool(args.calibrate_validation),
@@ -2092,6 +2468,9 @@ def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             "manifest_input_errors_csv": str(input_errors_csv_path),
             "family_risk_coverage_json": str(family_risk_coverage_json_path),
             "family_risk_coverage_csv": str(family_risk_coverage_csv_path),
+            "routing_by_family_csv": str(routing_csv_path),
+            "metrics_by_rvl_label_csv": str(per_label_csv_path),
+            "review_priority_order": [label for _rank, label in REVIEW_PRIORITIES],
         },
     }
     if scoped_target_families:
@@ -2108,6 +2487,8 @@ def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         "manifest_input_errors_csv": str(input_errors_csv_path),
         "family_risk_coverage_json": str(family_risk_coverage_json_path),
         "family_risk_coverage_csv": str(family_risk_coverage_csv_path),
+        "routing_by_family_csv": str(routing_csv_path),
+        "metrics_by_rvl_label_csv": str(per_label_csv_path),
     }
 
     if calibration_artifacts:

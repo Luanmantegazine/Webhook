@@ -32,7 +32,7 @@ gives four families a ground-truth label the classifier can never predict, so
 their recall reads as zero for a reason that has nothing to do with rule
 quality.
 
-## Taxonomy: one module, and what is still open
+## Taxonomy: one module, and the decisions it records
 
 `tasks/document/rvl_cdip_eval.py` is the single source of truth for the family
 list, the RVL-CDIP label mapping and the rejection targets. The classifier
@@ -44,15 +44,16 @@ checks on every evaluation run and refuses to reconcile silently.
 | Label | Family | Status |
 | --- | --- | --- |
 | `scientific publication` | `research_paper` | Settled |
-| `scientific report` | `technical_report` (default) or `research_paper` | **Open** — `scientific_report_family` |
-| press releases (no RVL class) | not `news_article` (default) | **Open** — `press_release_policy` |
+| `scientific report` | `technical_report` | **Accepted in v6** — `scientific_report_family` |
+| press releases (no RVL class) | not `news_article` | **Accepted in v6** — `press_release_policy` |
 
-Both open decisions are declared in one place, reported under
-`versions.taxonomy.pending_decisions` in every `report.json`, and configurable
-through the same keys in `config/rvl_cdip_taxonomy.json`. Changing
-`scientific_report_family` changes ground truth: metrics computed under
-different selections must not be pooled. `press_release_policy` changes only
-the `news_article` gate, not the labels.
+Both decisions are reported under `versions.taxonomy.decisions` in every
+`report.json` and remain configurable through the same keys in
+`config/rvl_cdip_taxonomy.json`. They are inputs the benchmark rests on, not
+open questions carried alongside the numbers. `scientific_report_family` is
+ground truth: results from before and after any change to it must not be
+pooled. `press_release_policy` changes only the `news_article` gate, never a
+label.
 
 ## Versions and fingerprints
 
@@ -132,7 +133,7 @@ Example result:
   "schema_version": "2.1",
   "taxonomy_version": "rvl-cdip-2.0",
   "feature_extraction_version": "2.3",
-  "classifier_version": "rules-rvl-cdip-v5+<rule_fingerprint>",
+  "classifier_version": "rules-rvl-cdip-v6+<rule_fingerprint>",
   "rule_fingerprint": "<12 hex>",
   "feature_fingerprint": "ff-<12 hex>",
   "classifier": "rules",
@@ -199,43 +200,95 @@ weighted sum cannot — *is this the kind of evidence that may decide this famil
 at all?* Gates are declared as data in `FAMILY_GATES`, evaluated by
 `evaluate_family_gates`, and applied in exactly one place: a family whose gate
 is not satisfied has its score set to `0.0` before ranking. The pre-gate score
-is kept in `evidence.pre_gate_scores`, and `evidence.family_gates` records, per
-family, which evidence groups fired, which rules merely corroborated, and which
-guard vetoed it.
+stays in `evidence.pre_gate_scores`, and `evidence.family_gates` records which
+acceptance path opened, what the unsatisfied paths were missing, which guard
+vetoed the family, and the declared refusal `reason`.
 
-Negative weights were the alternative, and they are close to unreadable: a large
-negative weight both suppresses a family and rescales every score around it, and
-no reader of the output can tell which of the two happened.
+A gate is a set of **acceptance paths**. Each path may require named rules
+(`all_of`), one rule from each of several pools (`any_of`), or *n* distinct
+evidence units (`min_units`, where a unit is a group of rules that are
+alternative readings of one observation). Several paths per family is the
+point: "a questionnaire heading with one structural signal" and "a form heading
+with two corroborating signals" are different cases with different evidence
+bars, and collapsing them into one count over a bag of rules loses exactly that
+distinction.
 
-| Family | Accepts when | Corroborating only | Guards against |
+| Family | Acceptance paths | Corroborating only | Guards against |
 | --- | --- | --- | --- |
-| `form_structured` | one strong primary (`form_heading`, `questionnaire_heading`) **or** two primaries (`checkboxes`, `blank_fields`) | `field_labels`, `short_field_regions`, `label_value_lines`, `tab_stop_alignment`, `field_geometry_regularity` | invoices, specifications, news, advertisements, budgets, resumes |
+| `form_structured` | **A** questionnaire heading + 1 structural signal · **B** checkboxes + 1 structural signal · **C** form heading + 2 structural signals | `field_labels`, `label_value_lines`, `tab_stop_alignment`, `field_geometry_regularity`, `short_field_regions`, `blank_fields` | invoices, specifications, news, advertisements, budgets, resumes |
 | `correspondence` | two independent signals among header block, e-mail markers, salutation, closing, memo heading, letter geometry, letter body | — | forms, news reporting |
 | `research_paper` | two of: academic structure, citations, editorial metadata, academic layout | `academic_vocabulary` | news reporting, invoices, forms |
-| `news_article` | two groups, one of which must be a journalistic source, a dateline, or the news layout | — | scientific publications, advertisements, forms, institutional correspondence, press releases |
-| `presentation_marketing` | one positive visual evidence: relevant pictures, landscape slide structure, short title over lists, or high visual area against low narrative density | `presentation_terms` | sparse or low-quality OCR with no visual evidence, forms, invoices |
+| `news_article` | **A** byline + (attribution quotes or justified body) · **B** wire service + dateline + (attribution quotes or justified body) | `attribution_quotes`, `multi_column_body`, `justified_body` | scientific publications, advertisements, forms, institutional correspondence, press releases |
+| `presentation_marketing` | one independent primary (slide structure, deck vocabulary, marketing copy) **and** one visual corroboration | `visual_layout`, `landscape_layout`, `visual_dominance`, `sparse_centered` | near-empty OCR, low-confidence OCR, forms, invoices |
 
-Three consequences worth stating explicitly, because they were the family's
-failure modes:
+Consequences worth stating explicitly, because each was a measured failure:
 
-- `field_labels` alone, `label_value_lines` alone, and geometry alone can never
-  classify a form. The old broad `field_grid` rule is deliberately not
-  reintroduced: prose, tables and columned reports all satisfy it.
-- Generic academic vocabulary (`results`, `method`, `study`, `report`) and a
-  bare date can never classify a research paper.
-- Short text, sparse text and low OCR confidence are guards, never evidence. A
-  handwritten page is not a presentation for having little text on it.
+- **Visual evidence cannot decide a presentation.** All four visual rules share
+  one scoring group, so a picture-heavy page contributes that evidence once
+  however many ways it is measured, and a document firing only those rules is
+  refused with `visual_evidence_only` at any threshold. The v5 run accepted 41
+  documents as presentations and got 6 right; every false accept fired
+  `visual_layout` together with `visual_dominance` for a score of `0.6333`.
+- **Structure alone cannot decide a form.** `field_labels`, `label_value_lines`
+  and geometry corroborate and never open a path. The broad `field_grid` rule
+  is not reintroduced under any name.
+- **A byline and a column count are not a news article.** `byline +
+  multi_column_body` and `wire_service + attribution_quotes` satisfy no path:
+  both admitted advertisements and scientific publications.
+- **Generic academic vocabulary** (`results`, `method`, `study`, `report`) and a
+  bare date can never decide a research paper.
+- **Short text is not a family.** Near-empty OCR is refused with
+  `insufficient_presentation_text`; the bar is deliberately low, because slides
+  *are* short and what keeps short picture pages out is the demand for
+  independent primary evidence, not a word count.
+
+### Rules removed in v6
+
+| Rule | Development-set behaviour | Disposition |
+| --- | --- | --- |
+| `news_article.headline_body` | 6 firings, 0 news articles | Removed. "A titled region over 250 words that is neither table nor picture" describes most typed pages; the name claimed evidence the implementation never measured. Nothing replaces it until the feature record carries headline typography. |
+| `presentation_marketing.bullet_layout` | 1 firing, 0 positives | Folded into `slide_structure`, which measures the same observation. Two rules for one observation summed into the decision twice. |
+
+`presentation_marketing.presentation_terms` was rewritten rather than removed:
+it had fired 6 times with 0 positives because it matched the bare word
+"presentation" and mixed slide vocabulary with marketing copy. It is now deck
+vocabulary in heading position, and the marketing half became `marketing_copy`.
+`slide_structure` fired 0 times because it required landscape orientation on a
+portrait-scanned corpus — a rule named for slide structure that was in fact
+measuring page orientation — and now measures the slide shape itself.
+`landscape_layout` also fired 0 times, but it measures what its name says and is
+kept for corpora that carry landscape pages; grouped with the other visual
+rules, it adds no decision mass.
 
 ### Per-family operating points
 
-`correspondence` is accepted at a lower threshold than the rest — the family's
-signals are individually weak and jointly decisive — and this is declared in
-`FAMILY_CONFIDENCE_THRESHOLDS`, not bought by lowering the global threshold for
-every family. A declared value is an *offset* from the module default, resolved
-by `resolve_family_thresholds` at whatever global threshold is in force, so a
-swept risk-coverage curve keeps describing the policy that actually runs. Every
-result reports `thresholds.family_confidence` and the
-`applied_confidence_threshold` of its own decision.
+The global threshold stays at `0.60`. Five families declare their own:
+
+| Family | Threshold | Status |
+| --- | --- | --- |
+| `resume` | 0.30 | development-set candidate |
+| `technical_report` | 0.31 | development-set candidate |
+| `correspondence` | 0.40 | development-set candidate |
+| `form_structured` | 0.40 | development-set candidate |
+| `research_paper` | 0.43 | development-set candidate |
+
+**These are candidates read off the development split, not calibrated
+thresholds**, and `FAMILY_THRESHOLD_PROVENANCE` carries that status
+(`development_set_candidate_requires_holdout`) into every report so no reader
+can mistake them for a calibration result. A holdout is what would make them
+one.
+
+`presentation_marketing`, `news_article` and `financial_document` are held at
+the global threshold on purpose, recorded in `FAMILY_THRESHOLD_HOLDS` with the
+reason: their problem was precision, and a lower bar is the one change that
+cannot help it.
+
+A declared value is an *offset* from the module default, resolved by
+`resolve_family_thresholds` at whatever global threshold is in force, so a swept
+risk-coverage curve keeps describing the policy that actually runs. Every
+prediction row reports `effective_family_threshold` beside
+`global_confidence_threshold`: a family judged at its own bar and reported under
+the global number is a lower bar that no table shows.
 
 ## Default thresholds
 
@@ -338,6 +391,41 @@ Generated results:
 
 ### Reading the report
 
+Every run writes, in addition to `predictions.csv` and `report.json`:
+
+| Artifact | Contents |
+| --- | --- |
+| `routing_by_family.csv` | Routing precision and recall for **every** scorable family, not only a scoped subset. Rejection targets count as negatives, so accepting a file folder is a false positive for the family that accepted it. |
+| `metrics_by_rvl_label.csv` | The same questions per original RVL-CDIP label. Three labels collapse onto `correspondence`: a family at 70% built from one label at 100% and another at 10% is not a family at 70%. |
+| `family_risk_coverage_curve.*` | One curve per scorable family, with rejection targets as negatives and `effective_family_threshold` on every point. |
+| `diagnostics_review.*` | Ordered by what an error costs, not by confidence. |
+
+Four fields answer "can an accepted answer be trusted", and sit at the top of
+`metrics`:
+
+| Field | Meaning |
+| --- | --- |
+| `accepted_routing_accuracy` | Of the accepted answers, the share naming the right family. |
+| `accepted_wrong_family_count` | Accepted answers naming the wrong family. |
+| `unsafe_accept_count` | The above, plus every rejection target that was accepted at all. |
+| `unsafe_accept_rate` | Unsafe accepts over all accepted decisions. |
+
+An unsafe accept is not the same as "not correct": a refusal costs coverage, an
+unsafe accept costs trust.
+
+`diagnostics_review` no longer carries a single `correct` column — it answered
+three questions at once, so a correctly routed out-of-scope document and a
+wrongly accepted file folder both read `False` and sorted together. It now
+carries `canonical_correct`, `scope_correct`, `is_unsafe_accept` and
+`is_rejection_false_accept`, and rows are ordered by review priority:
+
+1. `rejection_target_accepted` — a document that should have been declined;
+2. `accepted_wrong_family` — an accepted answer naming the wrong family;
+3. `high_confidence_false_positive` — the same error, told confidently;
+4. `false_negative_near_threshold` — a refusal that just missed its bar;
+5. `fallback_without_rules` — a gap in coverage, not a wrong answer.
+
+
 `other` is a real family *and* the sink for every abstention and fallback, and
 in `evaluate` mode the classifier can never positively predict it: a family is
 only ever returned on the `classified` path, and that family always comes from
@@ -416,8 +504,21 @@ fallback, insufficient-OCR abstention, the decision contract in all three
 modes, and agreement between `config/rvl_cdip_taxonomy.json` and the
 classifier's own family list.
 
+`tests/test_family_gates.py` covers the v6 gates. Each test encodes a failure
+the development run actually produced: visual-only evidence refused with
+`visual_evidence_only` and a zero score, the three declared presentation refusal
+reasons all reachable, the five development-set form shapes recovered by paths A
+and B while six form-shaped negatives stay refused, `byline + multi_column_body`
+and `wire_service + attribution_quotes` refused, the removed rules absent from
+`RULE_IDS`, the declared thresholds and their provenance, and the rule
+fingerprint stable across processes.
+
 `tests/test_evaluator_metrics.py` covers the evaluator's metric layer, which is
-where the experimental methodology lives: that refusals stay out of the
-classification metrics, that they land in the `<declined>` confusion column,
-that both end-to-end readings are reported and differ, and that false positives
-on a zero-support family are surfaced rather than dropped.
+where the experimental methodology lives: that refusals stay out of the accepted
+metrics and earn no true positives, that unsafe accepts are counted and separated
+from ordinary errors, that routing is measured for every scorable family, that
+per-label metrics exist, that rejection targets are negatives in the curves, and
+that the review order puts an accepted rejection target first. It was rewritten
+in v6: it had been importing an evaluator API that no longer existed, so the
+whole module raised `ImportError` on collection and every assertion in it had
+silently stopped running.
