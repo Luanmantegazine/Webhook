@@ -35,15 +35,19 @@ both paths consume the indicator vector, not the rule definitions.
 from __future__ import annotations
 
 from collections import Counter
+import hashlib
 import math
 import re
 import unicodedata
 from typing import Any, Callable, Iterable, NamedTuple
 
+from tasks.document.word_geometry import extract_geometry_features
 
-SCHEMA_VERSION = "2.0"
+SCHEMA_VERSION = "2.1"
 TAXONOMY_VERSION = "rvl-cdip-2.0"
-CLASSIFIER_VERSION = "rules-rvl-cdip-v3"
+# Bump whenever a derived feature's definition changes. The fingerprint then
+# invalidates stale cached features even when the emitted key set is unchanged.
+FEATURE_EXTRACTION_VERSION = "2.2"
 
 #: Provisional operating point, and the single source of truth for it. The task
 #: wrapper and the offline evaluator import these instead of restating them:
@@ -59,7 +63,9 @@ DEFAULT_MIN_RECOGNIZED_CHARACTERS = 20
 #: Document families. ``other`` is both the residual class and the destination
 #: of every abstention; :func:`classify_with_rules` reports ``decision`` and
 #: ``reason`` so the two can be told apart downstream. Evaluation code must
-#: never treat them as the same outcome.
+#: never treat them as the same outcome. This public taxonomy retains
+#: ``business_report`` for compatibility, although it is not an RVL-CDIP
+#: classification candidate because no canonical target maps to it.
 DOCUMENT_FAMILIES = (
     "research_paper",
     "technical_report",
@@ -73,7 +79,12 @@ DOCUMENT_FAMILIES = (
     "other",
 )
 
-SCORED_FAMILIES = tuple(family for family in DOCUMENT_FAMILIES if family != "other")
+#: RVL-CDIP classification candidates. Keep the public family taxonomy above
+#: stable, but exclude ``business_report`` from scoring so it cannot become a
+#: false-positive top candidate in the canonical evaluation.
+SCORED_FAMILIES = tuple(
+    family for family in DOCUMENT_FAMILIES if family not in {"other", "business_report"}
+)
 
 FAMILY_TEMPLATES = {
     "research_paper": "two_column_academic",
@@ -124,11 +135,10 @@ _DOI_RE = re.compile(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.IGNORECASE)
 # capital letters and single roman characters are excluded: they matched every
 # lettered list item in the previous revision.
 _NUMBERED_HEADING_RE = re.compile(
-    # A hierarchical number may stand alone ("3.1 Scope"); a bare number or a
-    # roman numeral must carry a separator, otherwise any line opening with a
-    # quantity would qualify.
-    r"(?m)^\s*(?:\d{1,2}(?:\.\d{1,2}){1,3}[.)]?|(?:\d{1,2}|[IVX]{2,6})[.)])\s+"
-    r"[A-Z][A-Za-z-]+(?:\s+[\w,'()-]+){1,10}\s*$"
+    # [ \t] rather than \s prevents a list item and the next line becoming one
+    # false heading.
+    r"(?m)^[ \t]*(?:\d{1,2}(?:\.\d{1,2}){1,3}[.)]?|(?:\d{1,2}|[IVX]{2,6})[.)])[ \t]+"
+    r"[A-Z][A-Za-z-]+(?:[ \t]+[\w,'()-]+){1,10}[ \t]*$"
 )
 
 # Captures the label so that correspondence headers (To/From/Subject/...) can be
@@ -325,6 +335,14 @@ def _text_key(value: str) -> str:
     return " ".join(value.split()).casefold()
 
 
+def _feature_fingerprint(features: dict[str, Any]) -> str:
+    keys = sorted(str(key) for key in features.keys())
+    digest = hashlib.sha1(
+        (f"{FEATURE_EXTRACTION_VERSION}\n" + "\n".join(keys)).encode("utf-8")
+    ).hexdigest()
+    return f"ff-{digest[:12]}"
+
+
 def _overlap_over_smaller(first: list[float], second: list[float]) -> float:
     """Intersection over the smaller box.
 
@@ -501,6 +519,7 @@ def _count_field_labels(text: str) -> tuple[int, int]:
 def extract_classification_features(
     document: dict,
     page_sizes: list | None = None,
+    page_words: list | None = None,
     max_text_chars: int = 20_000,
     provenance: dict | None = None,
 ) -> dict:
@@ -565,16 +584,15 @@ def extract_classification_features(
         for region in typed_regions:
             class_name = str(region.get("class_name") or "Unknown")
             class_counts[class_name] += 1
-            # The detector's own confidence is evidence about the evidence. On a
-            # low-resolution scan every downstream feature can be unreliable
-            # while looking perfectly well-formed; discarding this left the
-            # classifier unable to tell a clean document from a guess.
-            try:
-                confidence = float(region.get("confidence"))
-            except (TypeError, ValueError):
-                confidence = float("nan")
-            if math.isfinite(confidence):
-                region_confidences.append(confidence)
+            # Recovered docTR text is a non-detection, not a zero-confidence
+            # layout detection; keep it out of layout confidence statistics.
+            if region.get("source") != "doctr_fallback":
+                try:
+                    confidence = float(region.get("confidence"))
+                except (TypeError, ValueError):
+                    confidence = float("nan")
+                if math.isfinite(confidence):
+                    region_confidences.append(confidence)
             bbox = _valid_bbox(region.get("bbox"))
             if bbox is not None:
                 valid_bbox_count += 1
@@ -645,7 +663,7 @@ def extract_classification_features(
     accounting_term_count = len(_ACCOUNTING_TERM_RE.findall(text))
     currency_matches = len(_CURRENCY_RE.findall(text))
 
-    return {
+    extracted = {
         "schema_version": SCHEMA_VERSION,
         "taxonomy_version": TAXONOMY_VERSION,
         "provenance": dict(provenance) if isinstance(provenance, dict) else {},
@@ -715,6 +733,15 @@ def extract_classification_features(
         "year_range_count": len(_YEAR_RANGE_RE.findall(text)),
         "attribution_count": len(_ATTRIBUTION_RE.findall(text)),
     }
+    extracted.update(
+        extract_geometry_features(
+            page_words,
+            page_sizes=page_sizes,
+            page_count=total_pages,
+        )
+    )
+    extracted["feature_fingerprint"] = _feature_fingerprint(extracted)
+    return extracted
 
 
 # --------------------------------------------------------------------------
@@ -765,7 +792,7 @@ class RuleSpec(NamedTuple):
     family: str
     name: str
     group: str
-    requires: str  # "text" | "layout" | "multipage"
+    requires: str  # "text" | "layout" | "multipage" | "geometry"
     predicate: Callable[[_Context], bool]
 
     @property
@@ -778,11 +805,28 @@ def _rule(family: str, name: str, predicate, *, group: str = "", requires: str =
 
 
 # Patterns used only inside predicates.
-_ABSTRACT_RE = re.compile(r"(?:^|\n)\s*abstract\b|\babstract\s*[:—-]", re.IGNORECASE)
+_ABSTRACT_RE = re.compile(
+    r"(?:(?:^|\n)\s*abstract\b|\babstract\s*[:—-])"
+    # The first branch stops at ``abstract`` while the second consumes a
+    # delimiter. Include delimiters here so the guard applies to both forms.
+    r"(?![ \t:—-]*(?:form|sheet|submission|blank)\b)",
+    re.IGNORECASE,
+)
 _REFERENCES_RE = re.compile(r"(?m)^\s*(?:references|bibliography)\s*$", re.IGNORECASE)
 _ACADEMIC_SECTION_RE = re.compile(
     r"\b(?:methodology|methods|experimental results|related work|conclusions?)\b",
     re.IGNORECASE,
+)
+_ACADEMIC_SECTION_HEADING_RE = re.compile(
+    r"(?m)^\s*(?:\d+(?:\.\d+)*[.)]?\s*)?"
+    r"(?:methodology|methods|experimental results|related work|conclusions?)"
+    r"\s*[:.]?\s*$",
+    re.IGNORECASE,
+)
+_EDITORIAL_DATES_RE = re.compile(
+    r"\breceived\b.{0,100}\bacce(?:pt|pl)ed\b|"
+    r"\bacce(?:pt|pl)ed\b.{0,100}\breceived\b",
+    re.IGNORECASE | re.DOTALL,
 )
 _TECH_REPORT_RE = re.compile(r"\btechnical (?:report|specification)\b", re.IGNORECASE)
 _REQUIREMENTS_RE = re.compile(
@@ -835,14 +879,12 @@ def _visual_page(ctx: _Context) -> bool:
     return ctx.num("relevant_picture_count") >= 2 or ctx.flt("picture_area_ratio") >= 0.35
 
 
+def _typeset_body(ctx: _Context) -> bool:
+    return (ctx.flt('right_edge_regularity') >= 0.75 and ctx.flt('line_pitch_regularity') >= 0.70 and ctx.flt('wide_gap_line_ratio') <= 0.15 and ctx.num('word_line_count') >= 12)
+
+
 def _has_primary_correspondence_signal(ctx: _Context) -> bool:
-    return (
-        ctx.num("correspondence_header_count") >= 2
-        or ctx.has(_SALUTATION_RE)
-        or ctx.has(_CLOSING_RE)
-        or ctx.has(_MEMO_RE)
-        or ctx.has(_EMAIL_MARKER_RE)
-    )
+    return (ctx.num('correspondence_header_count') >= 2 or ctx.has(_SALUTATION_RE) or ctx.has(_CLOSING_RE) or ctx.has(_MEMO_RE) or ctx.has(_EMAIL_MARKER_RE))
 
 
 RULES: tuple[RuleSpec, ...] = (
@@ -851,13 +893,33 @@ RULES: tuple[RuleSpec, ...] = (
     _rule("research_paper", "references_heading", lambda c: c.has(_REFERENCES_RE)),
     _rule("research_paper", "doi", lambda c: c.num("doi_match_count") > 0, group="citation_evidence"),
     _rule("research_paper", "citations", lambda c: c.num("citation_match_count") >= 2, group="citation_evidence"),
-    _rule("research_paper", "academic_sections", lambda c: c.has(_ACADEMIC_SECTION_RE)),
+    _rule(
+        "research_paper",
+        "academic_section_headings",
+        lambda c: c.has(_ACADEMIC_SECTION_HEADING_RE),
+        group="academic_sections",
+    ),
+    _rule(
+        "research_paper",
+        "academic_vocabulary",
+        lambda c: c.has(_ACADEMIC_SECTION_RE),
+        group="academic_sections",
+    ),
+    _rule("research_paper", "editorial_dates", lambda c: c.has(_EDITORIAL_DATES_RE)),
     _rule("research_paper", "formula_layout", lambda c: c.flt("formula_density") >= 0.03),
+    # This remains a named group for compatibility, though its sole remaining
+    # member means replacement semantics are currently inert.
     _rule(
         "research_paper",
         "two_column_layout",
         lambda c: c.flt("two_column_ratio") >= 0.5,
         requires="layout",
+    ),
+    _rule(
+        "research_paper",
+        "justified_body",
+        _typeset_body,
+        requires="geometry",
     ),
     # ---- technical report ----------------------------------------------
     _rule("technical_report", "technical_report_phrase", lambda c: c.has(_TECH_REPORT_RE)),
@@ -928,10 +990,21 @@ RULES: tuple[RuleSpec, ...] = (
         lambda c: c.num("text_region_count") >= 5
         and c.flt("average_words_per_text_region") <= 8.0,
     ),
+    _rule(
+        "form_structured",
+        "label_value_lines",
+        lambda c: c.flt("label_value_line_ratio") >= 0.30,
+        # field_grid was removed; this sole member retains the group name for
+        # stable rule IDs, but replacement semantics are currently inert.
+        group="field_geometry",
+        requires="geometry",
+    ),
     # ---- presentation / advertisement -----------------------------------
-    # Landscape orientation and picture dominance are alternative expressions of
-    # the same "visual page" evidence, so they share a group: a corpus of
-    # portrait-only scans no longer deflates this family's attainable score.
+    # Presentation classification requires positive visual, list, or lexical
+    # evidence. Landscape orientation and picture dominance are alternative
+    # expressions of the same "visual page" evidence, so they share a group:
+    # a corpus of portrait-only scans no longer deflates this family's
+    # attainable score.
     _rule(
         "presentation_marketing",
         "visual_layout",
@@ -950,11 +1023,6 @@ RULES: tuple[RuleSpec, ...] = (
     ),
     _rule(
         "presentation_marketing",
-        "low_text_density",
-        lambda c: not _tables_dominate(c) and c.num("word_count") <= 120,
-    ),
-    _rule(
-        "presentation_marketing",
         "bullet_layout",
         lambda c: not _tables_dominate(c)
         and c.flt("list_density") >= 0.15
@@ -965,12 +1033,26 @@ RULES: tuple[RuleSpec, ...] = (
         "presentation_terms",
         lambda c: not _tables_dominate(c) and c.has(_PRESENTATION_TERM_RE),
     ),
+    _rule(
+        "presentation_marketing",
+        "sparse_centered",
+        lambda c: c.flt("centered_line_ratio") >= 0.30 and c.num("word_line_count") <= 25,
+        requires="geometry",
+    ),
     # ---- correspondence (letter / memo / e-mail) -------------------------
     _rule("correspondence", "header_block", lambda c: c.num("correspondence_header_count") >= 2),
     _rule("correspondence", "salutation", lambda c: c.has(_SALUTATION_RE)),
     _rule("correspondence", "closing", lambda c: c.has(_CLOSING_RE)),
     _rule("correspondence", "memo_heading", lambda c: c.has(_MEMO_RE)),
     _rule("correspondence", "email_markers", lambda c: c.has(_EMAIL_MARKER_RE)),
+    _rule(
+        "correspondence",
+        "letter_geometry",
+        lambda c: c.flt("top_band_header_ratio") >= 0.40
+        and c.flt("line_pitch_regularity") >= 0.60
+        and c.flt("body_wide_gap_line_ratio") <= 0.20,
+        requires="geometry",
+    ),
     # Corroborating, never standing alone: "short, single-page, no tables"
     # describes most scanned documents, so on its own it is not evidence of
     # anything. It may only add to a case that a primary signal has opened.
@@ -1000,6 +1082,12 @@ RULES: tuple[RuleSpec, ...] = (
         lambda c: c.flt("two_column_ratio") >= 0.5 and c.num("word_count") >= 200,
         requires="layout",
     ),
+    _rule(
+        "news_article",
+        "justified_body",
+        _typeset_body,
+        requires="geometry",
+    ),
 )
 
 RULE_IDS: tuple[str, ...] = tuple(rule.rule_id for rule in RULES)
@@ -1011,9 +1099,12 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     "research_paper.references_heading": 0.22,
     "research_paper.doi": 0.18,
     "research_paper.citations": 0.14,
-    "research_paper.academic_sections": 0.16,
+    "research_paper.academic_section_headings": 0.16,
+    "research_paper.academic_vocabulary": 0.05,
+    "research_paper.editorial_dates": 0.22,
     "research_paper.formula_layout": 0.08,
     "research_paper.two_column_layout": 0.08,
+    "research_paper.justified_body": 0.14,
     "technical_report.technical_report_phrase": 0.30,
     "technical_report.requirements_language": 0.22,
     "technical_report.engineering_sections": 0.18,
@@ -1043,16 +1134,18 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     "form_structured.blank_fields": 0.18,
     "form_structured.field_labels": 0.22,
     "form_structured.short_field_regions": 0.10,
+    "form_structured.label_value_lines": 0.26,
     "presentation_marketing.visual_layout": 0.22,
     "presentation_marketing.landscape_layout": 0.16,
-    "presentation_marketing.low_text_density": 0.08,
     "presentation_marketing.bullet_layout": 0.12,
     "presentation_marketing.presentation_terms": 0.24,
+    "presentation_marketing.sparse_centered": 0.16,
     "correspondence.header_block": 0.30,
     "correspondence.salutation": 0.24,
     "correspondence.closing": 0.18,
     "correspondence.memo_heading": 0.26,
     "correspondence.email_markers": 0.22,
+    "correspondence.letter_geometry": 0.22,
     "correspondence.letter_body": 0.08,
     "resume.resume_heading": 0.34,
     "resume.experience_section": 0.24,
@@ -1064,7 +1157,34 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     "news_article.wire_service": 0.20,
     "news_article.attribution_quotes": 0.16,
     "news_article.multi_column_body": 0.16,
+    "news_article.justified_body": 0.16,
 }
+
+
+def _rule_fingerprint() -> str:
+    parts = []
+    for rule in RULES:
+        weight = float(DEFAULT_WEIGHTS.get(rule.rule_id, 0.0))
+        predicate = rule.predicate
+        code = predicate.__code__
+        referenced_definitions = []
+        for name in sorted(code.co_names):
+            value = predicate.__globals__.get(name)
+            if isinstance(value, re.Pattern):
+                referenced_definitions.append(f"{name}={value.pattern!r}/{value.flags}")
+            elif callable(value) and hasattr(value, "__code__"):
+                referenced_definitions.append(
+                    f"{name}={value.__code__.co_code!r}/{value.__code__.co_consts!r}"
+                )
+        parts.append(
+            f"{rule.rule_id}|{rule.group}|{rule.requires}|{weight:.6f}|"
+            f"{code.co_code!r}|{code.co_consts!r}|{'|'.join(referenced_definitions)}"
+        )
+    digest = hashlib.sha1("\n".join(parts).encode("utf-8")).hexdigest()
+    return digest[:12]
+
+
+CLASSIFIER_VERSION = f"rules-rvl-cdip-v4+{_rule_fingerprint()}"
 
 
 def available_channels(features: dict) -> frozenset[str]:
@@ -1075,7 +1195,9 @@ def available_channels(features: dict) -> frozenset[str]:
             channels.add("layout")
         if int(features.get("total_pages") or 0) > 0:
             channels.add("multipage")
-    except (TypeError, ValueError):
+        if float(features["geometry_page_ratio"] or 0) > 0:
+            channels.add("geometry")
+    except (KeyError, TypeError, ValueError):
         pass
     return frozenset(channels)
 
@@ -1146,7 +1268,7 @@ def score_families(
 
     groups: dict[tuple[str, str], dict] = {}
     for rule in RULES:
-        if rule.requires not in channels:
+        if rule.family not in SCORED_FAMILIES or rule.requires not in channels:
             continue
         weight = float(effective.get(rule.rule_id, 0.0))
         slot = groups.setdefault(

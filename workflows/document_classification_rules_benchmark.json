@@ -91,7 +91,9 @@
         "confidence_threshold_formula": "inputs.confidence_threshold_formula",
         "default_confidence_threshold": "inputs.default_confidence_threshold",
         "table_structure_threshold": "inputs.table_structure_threshold",
-        "padding": "inputs.region_padding"
+        "padding": "inputs.region_padding",
+        "recover_uncovered_doctr_text": "inputs.recover_uncovered_doctr_text",
+        "uncovered_text_min_words": "inputs.uncovered_text_min_words"
       },
       "outputs": ["page_contents", "all_annotated_images", "page_words", "page_sizes"],
       "dependencies": [
@@ -117,6 +119,15 @@
       "inputs": {
         "document": "tasks.aggregate_content.document",
         "page_sizes": "tasks.detect_layout.page_sizes",
+        "page_words": "tasks.detect_layout.page_words",
+        "provenance": "inputs.classification_provenance",
+        "model_repository": "inputs.model_repository",
+        "model_filename": "inputs.model_filename",
+        "doctr_det_arch": "inputs.doctr_det_arch",
+        "doctr_reco_arch": "inputs.doctr_reco_arch",
+        "table_detection_model_name": "inputs.table_detection_model_name",
+        "table_structure_model_name": "inputs.table_structure_model_name",
+        "dpi": "inputs.dpi",
         "max_text_chars": "inputs.classification_max_text_chars"
       },
       "outputs": ["classification_features"],
@@ -130,14 +141,15 @@
         "confidence_threshold": "inputs.classification_confidence_threshold",
         "min_score_margin": "inputs.classification_min_score_margin",
         "min_recognized_characters": "inputs.classification_min_recognized_characters",
-        "classification_mode": {"literal": "evaluate"}
+        "classification_mode": {"literal": "evaluate"},
+        "include_indicators": "inputs.classification_include_indicators"
       },
       "outputs": ["classification"],
       "dependencies": ["extract_classification_features"]
     }
   ],
   "inputs": {
-    "image_path": "samples/rvl_cdip/example.tif",
+    "image_path": "data/rvl_cdip_subset/validation/images/rvl-validation-research_paper-0006.tif",
     "adapter_output_directory": "output/rvl_adapter",
     "pages": "all",
     "dpi": 300,
@@ -161,15 +173,20 @@
     "default_confidence_threshold": 0.15,
     "table_structure_threshold": 0.5,
     "region_padding": 2,
+    "recover_uncovered_doctr_text": true,
+    "uncovered_text_min_words": 2,
     "classification_max_text_chars": 20000,
-    "classification_confidence_threshold": 0.45,
-    "classification_min_score_margin": 0.08,
-    "classification_min_recognized_characters": 20
+    "classification_provenance": null,
+    "classification_confidence_threshold": 0.6,
+    "classification_min_score_margin": 0.1,
+    "classification_min_recognized_characters": 20,
+    "classification_include_indicators": false
   },
   "outputs": {
     "document": "tasks.aggregate_content.document",
     "full_text": "tasks.aggregate_content.full_text",
     "page_sizes": "tasks.detect_layout.page_sizes",
+    "page_words": "tasks.detect_layout.page_words",
     "classification_features": "tasks.extract_classification_features.classification_features",
     "classification": "tasks.classify_document.classification"
   }
