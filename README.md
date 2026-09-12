@@ -16,7 +16,7 @@ contracts, benchmark preparation, execution, and evaluation guidance.
 | `tasks/dataset/` | Scan-to-PDF adapter for the RVL-CDIP entry point. |
 | `workflows/` | Benchmark workflow, and the translation workflow with classification as a parallel observer. |
 | `config/rvl_cdip_taxonomy.json` | Declarative copy of the taxonomy. Verified against `tasks/document/rvl_cdip_eval.py` on every evaluation run. |
-| `scripts/` | RVL-CDIP subset preparation and offline evaluation from cached OCR output. |
+| `scripts/` | RVL-CDIP subset preparation, offline evaluation from cached OCR output, and the classifier-only latency benchmark. |
 | `tests/` | Unit tests. |
 
 ## Tests

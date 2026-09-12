@@ -63,7 +63,7 @@ label.
 | `TAXONOMY_VERSION` | The family set or the label mapping changes. |
 | `FEATURE_EXTRACTION_VERSION` | Any derived feature's definition changes. |
 | `feature_fingerprint` | The emitted feature key set or the extraction version changes. Recomputable from the record itself. |
-| `CLASSIFIER_VERSION` / `rule_fingerprint` | Any rule, weight, group, channel, gate, blocker, family threshold or decision-group count changes. |
+| `CLASSIFIER_VERSION` / `rule_fingerprint` | Any rule, weight, substitutable group, channel, gate, blocker, family threshold, decision-group count, **or global operating point** (threshold, minimum margin, minimum recognised characters) changes. |
 
 The rule fingerprint is computed from rule *source* where available rather than
 from bytecode reprs: nested code objects render with their memory address, so
@@ -133,7 +133,7 @@ Example result:
   "schema_version": "2.1",
   "taxonomy_version": "rvl-cdip-2.0",
   "feature_extraction_version": "2.3",
-  "classifier_version": "rules-rvl-cdip-v6+<rule_fingerprint>",
+  "classifier_version": "rules-rvl-cdip-v7+<rule_fingerprint>",
   "rule_fingerprint": "<12 hex>",
   "feature_fingerprint": "ff-<12 hex>",
   "classifier": "rules",
@@ -219,16 +219,23 @@ distinction.
 | `correspondence` | two independent signals among header block, e-mail markers, salutation, closing, memo heading, letter geometry, letter body | — | forms, news reporting |
 | `research_paper` | two of: academic structure, citations, editorial metadata, academic layout | `academic_vocabulary` | news reporting, invoices, forms |
 | `news_article` | **A** byline + (attribution quotes or justified body) · **B** wire service + dateline + (attribution quotes or justified body) | `attribution_quotes`, `multi_column_body`, `justified_body` | scientific publications, advertisements, forms, institutional correspondence, press releases |
-| `presentation_marketing` | one independent primary (slide structure, deck vocabulary, marketing copy) **and** one visual corroboration | `visual_layout`, `landscape_layout`, `visual_dominance`, `sparse_centered` | near-empty OCR, low-confidence OCR, forms, invoices |
+| `presentation_marketing` | deck vocabulary (`presentation_terms`) **and** one visual/structural corroboration | `visual_layout`, `landscape_layout`, `visual_dominance`, `sparse_centered`, `slide_structure`, `marketing_copy` | near-empty OCR, low-confidence OCR, forms, invoices |
 
 Consequences worth stating explicitly, because each was a measured failure:
 
-- **Visual evidence cannot decide a presentation.** All four visual rules share
-  one scoring group, so a picture-heavy page contributes that evidence once
-  however many ways it is measured, and a document firing only those rules is
-  refused with `visual_evidence_only` at any threshold. The v5 run accepted 41
-  documents as presentations and got 6 right; every false accept fired
-  `visual_layout` together with `visual_dominance` for a score of `0.6333`.
+- **Visual and structural evidence cannot decide a presentation.** All five of
+  `visual_layout`, `landscape_layout`, `visual_dominance`, `sparse_centered` and
+  `slide_structure` share one scoring group, so a page contributes that evidence
+  once however many ways it is measured, and a document firing only those rules
+  is refused with `visual_evidence_only` at any threshold. This was tightened
+  twice on measurement: v5 accepted 41 and got 6 right, every false accept
+  firing `visual_layout` with `visual_dominance` at `0.6333`; v6 still accepted
+  an invoice and a form, both firing `visual_layout` with `slide_structure` at
+  `0.6562` — **higher than the only true positive at `0.625`**, which is why no
+  threshold could separate them and why the fix had to be structural.
+- **Advertising copy cannot decide one either.** `marketing_copy` corroborates
+  but opens no path: on the development set it fired exactly once, for an
+  invoice.
 - **Structure alone cannot decide a form.** `field_labels`, `label_value_lines`
   and geometry corroborate and never open a path. The broad `field_grid` rule
   is not reintroduced under any name.
@@ -249,6 +256,17 @@ Consequences worth stating explicitly, because each was a measured failure:
 | `news_article.headline_body` | 6 firings, 0 news articles | Removed. "A titled region over 250 words that is neither table nor picture" describes most typed pages; the name claimed evidence the implementation never measured. Nothing replaces it until the feature record carries headline typography. |
 | `presentation_marketing.bullet_layout` | 1 firing, 0 positives | Folded into `slide_structure`, which measures the same observation. Two rules for one observation summed into the decision twice. |
 
+### Rules regrouped in v7
+
+| Rule | Change | Why |
+| --- | --- | --- |
+| `presentation_marketing.slide_structure` | primary → member of the `visual_evidence` group | As an independent primary it let an invoice and a form reach `0.6562`. "A titled page of short text blocks" describes both of those as well as it describes a slide. |
+| `presentation_marketing.marketing_copy` | primary → corroborating | Fired once on the development set, for an invoice. It still adds score once a case is open; it may no longer be the case. |
+
+No predicate, weight or threshold in `form_structured`, `research_paper`,
+`news_article`, `resume`, `technical_report` or `financial_document` was touched
+in v7.
+
 `presentation_marketing.presentation_terms` was rewritten rather than removed:
 it had fired 6 times with 0 positives because it matched the bare word
 "presentation" and mixed slide vocabulary with marketing copy. It is now deck
@@ -268,7 +286,7 @@ The global threshold stays at `0.60`. Five families declare their own:
 | --- | --- | --- |
 | `resume` | 0.30 | development-set candidate |
 | `technical_report` | 0.31 | development-set candidate |
-| `correspondence` | 0.40 | development-set candidate |
+| `correspondence` | 0.42 | development-set candidate (v7: was 0.40) |
 | `form_structured` | 0.40 | development-set candidate |
 | `research_paper` | 0.43 | development-set candidate |
 
@@ -277,6 +295,11 @@ thresholds**, and `FAMILY_THRESHOLD_PROVENANCE` carries that status
 (`development_set_candidate_requires_holdout`) into every report so no reader
 can mistake them for a calibration result. A holdout is what would make them
 one.
+
+The v7 move of `correspondence` from 0.40 to 0.42 was read off the *same* 270
+documents as the v6 value, so it is the same kind of candidate and not a firmer
+one. Do not re-tune it on those documents again: a threshold fitted twice to one
+split is fitted to that split, whatever the second reading shows.
 
 `presentation_marketing`, `news_article` and `financial_document` are held at
 the global threshold on purpose, recorded in `FAMILY_THRESHOLD_HOLDS` with the
@@ -473,6 +496,49 @@ This needs `alnum_character_count`, which `predictions.csv` now carries: the
 OCR-sufficiency gate is part of the decision policy, and a sweep that cannot
 see that count silently mis-reports the whole low-threshold end of the curve as
 higher coverage than the classifier would really give.
+
+## Routing readiness
+
+No family is production-ready: every number here comes from a development split
+with no holdout, so `ROUTING_RELEASE_STATUS` marks each scorable family
+`development_only` and every result carries
+`released_for_automatic_routing: false`.
+
+Two families are withheld from automatic routing even in development, and stay
+withheld in v7:
+
+| Family | Reason |
+| --- | --- |
+| `presentation_marketing` | Gate rebuilt for the second consecutive version; its precision has not been measured since. |
+| `financial_document` | Nothing in the development run examined its precision. |
+
+## Classifier latency
+
+`scripts/benchmark_classifier_latency.py` measures `classify_with_rules` and
+nothing else:
+
+```bash
+python scripts/benchmark_classifier_latency.py benchmark_manifest.csv \
+  --output output/classifier_latency.json --repetitions 20 --trials 3
+```
+
+Every feature record is loaded and validated before timing starts, so module
+import, JSON reading, OCR, layout detection and feature extraction are outside
+the measured region entirely. A warm-up pass runs first. The two modes are timed
+separately and three independent trials run end to end; the report gives mean,
+median, p90, p95, p99, standard deviation, min and max per trial, plus the
+median of the three p95 values.
+
+The report's `measurement` block names what was measured and what was not.
+`indicators_off` is the operational series: `include_indicators=True` builds a
+diagnostic vector production never asks for, and quoting its latency as the
+pipeline's overstates it. The script also verifies that both modes produce the
+same decision, family, scores and margins, and exits non-zero if they do not —
+a cheaper measurement of a different classifier is not a measurement of this
+one.
+
+This is classifier time only. End-to-end latency is dominated by OCR and layout
+detection, which this script does not measure at all.
 
 ## Important evaluation boundaries
 

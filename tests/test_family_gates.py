@@ -1,4 +1,4 @@
-"""Tests for the v6 family gates.
+"""Tests for the family gates.
 
 Each test here encodes a failure the development run actually produced, so
 that a later change which reopens one of them fails loudly rather than
@@ -19,7 +19,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tasks.document.rules_classifier_core import (  # noqa: E402
     BLOCKER_PREDICATES,
+    CLASSIFIER_VERSION,
     DEFAULT_CONFIDENCE_THRESHOLD,
+    DEFAULT_MIN_RECOGNIZED_CHARACTERS,
+    DEFAULT_MIN_SCORE_MARGIN,
     DEFAULT_WEIGHTS,
     FAMILY_CONFIDENCE_THRESHOLDS,
     FAMILY_GATES,
@@ -29,10 +32,15 @@ from tasks.document.rules_classifier_core import (  # noqa: E402
     RULE_IDS,
     RULES,
     SCORED_FAMILIES,
+    FAMILIES_NOT_RELEASED_FOR_ROUTING,
+    ROUTING_RELEASE_STATUS,
+    apply_decision_policy,
     classify_with_rules,
     effective_family_threshold,
+    evaluate_family_gates,
     extract_classification_features,
     resolve_family_thresholds,
+    score_families,
 )
 
 PAGE = [1200, 1600]
@@ -59,6 +67,28 @@ def classify(regions, page_size=None, **kwargs):
 
 def gate_of(result, family):
     return result["evidence"]["family_gates"][family]
+
+
+GATE_BY_FAMILY = {gate.family: gate for gate in FAMILY_GATES}
+
+
+def presentation_indicators(*names):
+    """Only the named presentation rules fire; nothing else does."""
+    return {
+        rule_id: rule_id in {f"presentation_marketing.{name}" for name in names}
+        for rule_id in RULE_IDS
+    }
+
+
+#: Features with every channel available and enough recognised text that no
+#: OCR-sufficiency guard fires, so a probe measures the gate and nothing else.
+PROBE_FEATURES = {
+    "word_count": 120,
+    "alnum_character_count": 600,
+    "measured_page_ratio": 1.0,
+    "geometry_page_ratio": 1.0,
+    "total_pages": 1,
+}
 
 
 # --------------------------------------------------------------------------
@@ -99,6 +129,28 @@ def advertisement_with_visual_support():
             "purchase made today.",
             "Text",
             [50, 950, 1150, 1100],
+        ),
+    ]
+
+
+def deck_vocabulary_without_corroboration():
+    """Deck vocabulary on a page with no visual or structural shape at all."""
+    return [
+        region("Agenda", "Title", [50, 40, 600, 110]),
+        region(
+            "The committee met to review the schedule and agreed that the revised "
+            "timetable would be circulated to every department before the end of the "
+            "month, with comments returned in writing by the following Friday so that "
+            "the final version can be approved at the next ordinary sitting.",
+            "Text",
+            [50, 150, 1150, 700],
+        ),
+        region(
+            "A second paragraph of ordinary running prose, long enough that the page is "
+            "narrative rather than a sparse arrangement of short blocks, and wide enough "
+            "that no column or centring signal is produced by it either.",
+            "Text",
+            [50, 720, 1150, 1200],
         ),
     ]
 
@@ -257,8 +309,13 @@ class PresentationGateTests(unittest.TestCase):
         self.assertEqual(result["candidate_scores"]["presentation_marketing"], 0.0)
         self.assertNotEqual(result["document_family"], "presentation_marketing")
 
-    def test_visual_rules_share_one_scoring_group(self):
-        """Two visual rules must not sum into the decision mass."""
+    def test_visual_and_structural_rules_share_one_scoring_group(self):
+        """No two of them may sum into the decision mass.
+
+        ``slide_structure`` joined the group in v7: as an independent primary it
+        let an invoice and a form reach 0.6562 while the only true positive sat
+        at 0.625.
+        """
         visual = {
             rule.name
             for rule in RULES
@@ -266,24 +323,38 @@ class PresentationGateTests(unittest.TestCase):
         }
         self.assertEqual(
             visual,
-            {"visual_layout", "landscape_layout", "visual_dominance", "sparse_centered"},
+            {
+                "visual_layout",
+                "landscape_layout",
+                "visual_dominance",
+                "sparse_centered",
+                "slide_structure",
+            },
         )
 
-    def test_primary_with_visual_support_is_accepted(self):
-        for name, regions in (
-            ("slide", slide_with_visual_support()),
-            ("advertisement", advertisement_with_visual_support()),
-        ):
-            with self.subTest(document=name):
-                result = classify(regions)
-                gate = gate_of(result, "presentation_marketing")
-                self.assertEqual(gate["status"], "satisfied")
-                self.assertEqual(result["document_family"], "presentation_marketing")
-                self.assertEqual(result["decision"], "classified")
+    def test_deck_vocabulary_with_visual_support_is_accepted(self):
+        result = classify(slide_with_visual_support())
+        gate = gate_of(result, "presentation_marketing")
+        self.assertEqual(gate["status"], "satisfied")
+        self.assertEqual(result["document_family"], "presentation_marketing")
+        self.assertEqual(result["decision"], "classified")
 
-    def test_primary_without_visual_support_is_refused(self):
-        regions = [item for item in slide_with_visual_support() if item["class_name"] != "Picture"]
-        result = classify(regions)
+    def test_marketing_copy_does_not_open_a_path(self):
+        """v7: on the development set ``marketing_copy`` fired once, for an invoice.
+
+        It still contributes score once a case is open; it may no longer be the
+        case. The cost is real — an advertisement carrying no deck vocabulary is
+        now refused — and it is taken deliberately.
+        """
+        result = classify(advertisement_with_visual_support())
+        gate = gate_of(result, "presentation_marketing")
+        self.assertNotEqual(gate["status"], "satisfied")
+        self.assertNotEqual(result["document_family"], "presentation_marketing")
+        self.assertEqual(result["candidate_scores"]["presentation_marketing"], 0.0)
+        self.assertNotIn("marketing_copy", GATE_BY_FAMILY["presentation_marketing"].primary)
+
+    def test_deck_vocabulary_without_any_corroboration_is_refused(self):
+        result = classify(deck_vocabulary_without_corroboration())
         gate = gate_of(result, "presentation_marketing")
         self.assertEqual(gate["status"], "insufficient_evidence")
         self.assertEqual(gate["reason"], "missing_independent_presentation_evidence")
@@ -301,14 +372,7 @@ class PresentationGateTests(unittest.TestCase):
                 "reason"
             ],
             gate_of(
-                classify(
-                    [
-                        item
-                        for item in slide_with_visual_support()
-                        if item["class_name"] != "Picture"
-                    ]
-                ),
-                "presentation_marketing",
+                classify(deck_vocabulary_without_corroboration()), "presentation_marketing"
             )["reason"],
             gate_of(classify(near_empty_picture_page()), "presentation_marketing")["reason"],
         }
@@ -334,6 +398,141 @@ class PresentationGateTests(unittest.TestCase):
         """``bullet_layout`` measured what ``slide_structure`` now measures."""
         self.assertNotIn("presentation_marketing.bullet_layout", RULE_IDS)
         self.assertNotIn("presentation_marketing.bullet_layout", DEFAULT_WEIGHTS)
+
+
+class PresentationV7ProbeTests(unittest.TestCase):
+    """The four probes the v7 change is defined by.
+
+    Driven from indicator vectors rather than documents, so each probe tests
+    exactly one combination of fired rules and nothing else. The
+    document-shaped versions of the same cases are in
+    :class:`PresentationFalsePositiveShapeTests` below.
+    """
+
+    def probe(self, *rules):
+        indicators = presentation_indicators(*rules)
+        gates = evaluate_family_gates(PROBE_FEATURES, indicators)
+        breakdown = score_families(PROBE_FEATURES, indicators)
+        return gates["presentation_marketing"], breakdown["presentation_marketing"]
+
+    def test_visual_layout_with_slide_structure_is_blocked(self):
+        gate, _score = self.probe("visual_layout", "slide_structure")
+        self.assertNotEqual(gate["status"], "satisfied")
+        self.assertEqual(gate["reason"], "visual_evidence_only")
+
+    def test_visual_dominance_with_slide_structure_is_blocked(self):
+        gate, _score = self.probe("visual_dominance", "slide_structure")
+        self.assertNotEqual(gate["status"], "satisfied")
+        self.assertEqual(gate["reason"], "visual_evidence_only")
+
+    def test_slide_structure_with_sparse_centered_is_blocked(self):
+        gate, _score = self.probe("slide_structure", "sparse_centered")
+        self.assertNotEqual(gate["status"], "satisfied")
+        self.assertEqual(gate["reason"], "visual_evidence_only")
+
+    def test_visual_layout_with_presentation_terms_is_satisfied(self):
+        gate, _score = self.probe("visual_layout", "presentation_terms")
+        self.assertEqual(gate["status"], "satisfied")
+        self.assertEqual(gate["reason"], "path_deck_vocabulary_with_visual_support")
+
+    def test_two_group_members_never_outscore_the_accepting_case(self):
+        """The v6 arithmetic that no threshold could fix.
+
+        Two visual/structural rules used to sum to 0.6562 while the only true
+        positive — deck vocabulary with one visual signal — sat at 0.625.
+        """
+        _gate, false_positive = self.probe("visual_layout", "slide_structure")
+        _gate, true_positive = self.probe("visual_layout", "presentation_terms")
+        self.assertLess(false_positive["score"], true_positive["score"])
+        self.assertGreaterEqual(true_positive["score"], DEFAULT_CONFIDENCE_THRESHOLD)
+
+    def test_every_pair_without_deck_vocabulary_is_refused(self):
+        visual = (
+            "visual_layout",
+            "landscape_layout",
+            "visual_dominance",
+            "sparse_centered",
+            "slide_structure",
+        )
+        for first in visual:
+            for second in visual:
+                if first >= second:
+                    continue
+                with self.subTest(pair=(first, second)):
+                    gate, score = self.probe(first, second)
+                    self.assertNotEqual(gate["status"], "satisfied")
+                    self.assertLess(score["score"], DEFAULT_CONFIDENCE_THRESHOLD)
+
+    def test_marketing_copy_alone_does_not_open_the_gate(self):
+        for companion in ("visual_layout", "slide_structure"):
+            with self.subTest(companion=companion):
+                gate, _score = self.probe("marketing_copy", companion)
+                self.assertNotEqual(gate["status"], "satisfied")
+
+    def test_threshold_is_unchanged_at_the_global_value(self):
+        self.assertNotIn("presentation_marketing", FAMILY_CONFIDENCE_THRESHOLDS)
+        self.assertEqual(
+            effective_family_threshold(
+                "presentation_marketing", DEFAULT_CONFIDENCE_THRESHOLD
+            ),
+            0.60,
+        )
+
+
+class PresentationFalsePositiveShapeTests(unittest.TestCase):
+    """The two documents v6 still got wrong, reproduced as shapes.
+
+    Named for what the pages look like, never for the samples: the classifier
+    must not be able to tell which corpus document it is looking at, and a test
+    keyed to a sample id would be testing a lookup rather than a rule.
+    """
+
+    def assert_not_a_presentation(self, regions, page_size=None):
+        result = classify(regions, page_size=page_size)
+        gate = gate_of(result, "presentation_marketing")
+        self.assertNotEqual(result["document_family"], "presentation_marketing")
+        self.assertNotEqual(gate["status"], "satisfied")
+        self.assertEqual(result["candidate_scores"]["presentation_marketing"], 0.0)
+        return result
+
+    def test_illustrated_invoice_shape_is_not_a_presentation(self):
+        self.assert_not_a_presentation(
+            [
+                region("INVOICE 4417", "Title", [50, 40, 600, 110]),
+                region("", "Picture", [50, 150, 1150, 700]),
+                region("", "Picture", [50, 720, 1150, 1180]),
+                region("Bill To: Acme", "Text", [50, 1200, 560, 1250]),
+                region("Amount Due $412.00", "Text", [50, 1260, 560, 1310]),
+                region("Terms: net 30", "Text", [50, 1320, 560, 1370]),
+            ]
+        )
+
+    def test_illustrated_form_shape_is_not_a_presentation(self):
+        self.assert_not_a_presentation(
+            [
+                region("REQUEST FORM", "Title", [50, 40, 600, 110]),
+                region("", "Picture", [50, 150, 1150, 700]),
+                region("", "Picture", [50, 720, 1150, 1180]),
+                region("Name: ______", "Text", [50, 1200, 560, 1250]),
+                region("Unit: ______", "Text", [50, 1260, 560, 1310]),
+                region("[ ] Yes  [ ] No", "List-item", [50, 1320, 560, 1370]),
+            ]
+        )
+
+    def test_handwritten_and_file_folder_shapes_are_not_presentations(self):
+        shapes = {
+            "handwritten_note": [
+                region("note to self about tomorrow morning and the meeting", "Text"),
+            ],
+            "file_folder_tab": [
+                region("", "Picture", [50, 50, 1150, 1400]),
+                region("CORRESPONDENCE 1978 GENERAL FILE", "Title", [50, 1420, 800, 1500]),
+            ],
+        }
+        for name, regions in shapes.items():
+            with self.subTest(document=name):
+                result = classify(regions)
+                self.assertNotEqual(result["document_family"], "presentation_marketing")
 
 
 # --------------------------------------------------------------------------
@@ -436,6 +635,72 @@ class NewsGateTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
+# correspondence
+# --------------------------------------------------------------------------
+
+
+class CorrespondenceThresholdTests(unittest.TestCase):
+    """v7 moves the family bar from 0.40 to 0.42. Rules and gate are untouched."""
+
+    def setUp(self):
+        self.family_thresholds = resolve_family_thresholds(DEFAULT_CONFIDENCE_THRESHOLD)
+
+    def decide(self, score, margin=0.30):
+        return apply_decision_policy(
+            [("correspondence", score), ("other", round(score - margin, 4))],
+            500,
+            DEFAULT_CONFIDENCE_THRESHOLD,
+            DEFAULT_MIN_SCORE_MARGIN,
+            DEFAULT_MIN_RECOGNIZED_CHARACTERS,
+            "evaluate",
+            self.family_thresholds,
+        )
+
+    def test_declared_threshold_is_the_v7_value(self):
+        self.assertEqual(FAMILY_CONFIDENCE_THRESHOLDS["correspondence"], 0.42)
+        self.assertEqual(
+            FAMILY_THRESHOLD_PROVENANCE["correspondence"],
+            "development_set_candidate_requires_holdout",
+        )
+        self.assertEqual(self.family_thresholds["correspondence"], 0.42)
+
+    def test_score_below_the_threshold_is_refused(self):
+        decision = self.decide(0.41)
+        self.assertEqual(decision["decision"], "fallback")
+        self.assertEqual(decision["reason"], "score_below_threshold")
+        self.assertEqual(decision["document_family"], "other")
+        self.assertEqual(decision["applied_confidence_threshold"], 0.42)
+
+    def test_score_at_the_threshold_with_margin_is_accepted(self):
+        decision = self.decide(0.42)
+        self.assertEqual(decision["decision"], "classified")
+        self.assertEqual(decision["document_family"], "correspondence")
+        self.assertEqual(decision["applied_confidence_threshold"], 0.42)
+
+    def test_score_above_the_threshold_without_margin_still_abstains(self):
+        """The margin is not relaxed along with the threshold."""
+        decision = self.decide(0.50, margin=0.02)
+        self.assertEqual(decision["decision"], "abstained")
+        self.assertEqual(decision["reason"], "ambiguous_rule_scores")
+
+    def test_an_ordinary_letter_is_still_accepted(self):
+        result = classify(
+            [
+                region("Dear Mr Smith,", "Title", index=0),
+                region(
+                    "Thank you for your note about the shipment schedule for the coming "
+                    "quarter. We will confirm the revised dates in writing next week.",
+                    index=1,
+                ),
+                region("Sincerely yours,\nJ. Doe", index=2),
+            ]
+        )
+        self.assertEqual(result["document_family"], "correspondence")
+        self.assertEqual(result["decision"], "classified")
+        self.assertGreaterEqual(result["score"], 0.42)
+
+
+# --------------------------------------------------------------------------
 # Configuration invariants
 # --------------------------------------------------------------------------
 
@@ -463,7 +728,7 @@ class GateConfigurationTests(unittest.TestCase):
         self.assertEqual(
             FAMILY_CONFIDENCE_THRESHOLDS,
             {
-                "correspondence": 0.40,
+                "correspondence": 0.42,
                 "form_structured": 0.40,
                 "research_paper": 0.43,
                 "resume": 0.30,
