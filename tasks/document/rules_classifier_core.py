@@ -509,6 +509,13 @@ def classifier_versions() -> dict[str, Any]:
         "family_confidence_thresholds": dict(FAMILY_CONFIDENCE_THRESHOLDS),
         "family_threshold_provenance": dict(FAMILY_THRESHOLD_PROVENANCE),
         "family_threshold_holds": dict(FAMILY_THRESHOLD_HOLDS),
+        "global_confidence_threshold": DEFAULT_CONFIDENCE_THRESHOLD,
+        "global_min_score_margin": DEFAULT_MIN_SCORE_MARGIN,
+        "global_min_recognized_characters": DEFAULT_MIN_RECOGNIZED_CHARACTERS,
+        "routing_release_status": dict(ROUTING_RELEASE_STATUS),
+        "families_not_released_for_automatic_routing": sorted(
+            FAMILIES_NOT_RELEASED_FOR_ROUTING
+        ),
         "taxonomy": taxonomy_descriptor(),
     }
 
@@ -1312,13 +1319,15 @@ RULES: tuple[RuleSpec, ...] = (
         group="visual_evidence",
         requires="geometry",
     ),
-    # Primary, structural. v6 audit: the previous version required landscape
-    # orientation and fired 0 times, so a rule named for slide structure was in
-    # fact measuring page orientation. It now measures the slide shape itself —
-    # a titled page of short, listed text — and treats landscape as one way of
-    # satisfying the shape rather than a precondition. ``bullet_layout`` was
-    # removed: "a short title over lists" is this same observation, and two
-    # rules measuring it summed into the decision twice.
+    # v7 audit. ``slide_structure`` was primary evidence in v6 and is now a
+    # member of the same substitutable group as the four visual rules. The two
+    # surviving false accepts — an invoice and a form — each fired
+    # ``visual_layout`` together with ``slide_structure`` for 0.6562, while the
+    # single true positive fired ``visual_layout`` with ``presentation_terms``
+    # for 0.625. The false accepts outscored the true positive, so no threshold
+    # separates them; what separates them is that "a titled page of short text
+    # blocks" describes an invoice and a form just as well as a slide. It is a
+    # corroborating shape, not an independent reason to call a scan a deck.
     _rule(
         "presentation_marketing",
         "slide_structure",
@@ -1329,6 +1338,7 @@ RULES: tuple[RuleSpec, ...] = (
             c.flt("list_density") >= 0.10
             or c.flt("average_words_per_text_region") <= 12.0
         ),
+        group="visual_evidence",
         requires="layout",
     ),
     # Primary, lexical: deck vocabulary in heading position. See the pattern
@@ -1465,11 +1475,14 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     "form_structured.label_value_lines": 0.14,
     "form_structured.tab_stop_alignment": 0.10,
     "form_structured.field_geometry_regularity": 0.08,
-    # One visual group (capacity 0.22) plus two lexical primaries and one
-    # structural primary. Decision mass is 0.64, so the minimum accepting case
-    # — one primary with one visual corroboration — lands just above the global
-    # 0.60 threshold, and visual evidence on its own reaches 0.34 before the
-    # gate zeroes it. The family's threshold is deliberately *not* lowered.
+    # v7: one visual/structural group (capacity 0.22, now including
+    # ``slide_structure``) plus the two lexical rules. Decision mass is 0.62, so
+    # the only accepting case — deck vocabulary with one corroborating
+    # visual/structural signal — reaches 0.645, just above the global 0.60
+    # threshold, which is deliberately neither raised nor lowered. Every
+    # combination of visual and structural rules without ``presentation_terms``
+    # is now worth 0.22 of a group before the gate zeroes it, where v6 let two
+    # of them sum to 0.42 and outscore the one true positive.
     "presentation_marketing.visual_layout": 0.22,
     "presentation_marketing.landscape_layout": 0.16,
     "presentation_marketing.visual_dominance": 0.16,
@@ -1787,16 +1800,22 @@ _CORRESPONDENCE_SIGNALS: tuple[str, ...] = (
     "letter_body",
 )
 
-_PRESENTATION_PRIMARY: tuple[str, ...] = (
-    "slide_structure",
-    "presentation_terms",
-    "marketing_copy",
-)
+#: v7: deck vocabulary is the only independent reason to call a document a
+#: presentation. ``marketing_copy`` is deliberately not here — on the
+#: development set it fired exactly once, for an invoice — and
+#: ``slide_structure`` moved out, for the reason recorded beside the rule.
+_PRESENTATION_PRIMARY: tuple[str, ...] = ("presentation_terms",)
+
+#: Substitutable visual and structural shapes. One of them must corroborate the
+#: primary; which one, and how many, does not matter — they are one observation
+#: of "this page looks like a slide" seen five ways, and they share a scoring
+#: group so they cannot sum.
 _PRESENTATION_VISUAL: tuple[str, ...] = (
     "visual_layout",
     "landscape_layout",
     "visual_dominance",
     "sparse_centered",
+    "slide_structure",
 )
 
 
@@ -1962,12 +1981,13 @@ FAMILY_GATES: tuple[FamilyGate, ...] = (
         # every false accept was visual evidence and nothing else.
         paths=(
             GatePath(
-                name="independent_primary_with_visual_support",
-                any_of=(_PRESENTATION_PRIMARY, _PRESENTATION_VISUAL),
+                name="deck_vocabulary_with_visual_support",
+                all_of=("presentation_terms",),
+                any_of=(_PRESENTATION_VISUAL,),
             ),
         ),
         primary=_PRESENTATION_PRIMARY,
-        corroborating=_PRESENTATION_VISUAL,
+        corroborating=_PRESENTATION_VISUAL + ("marketing_copy",),
         blockers=(
             "presentation_text_too_sparse",
             "low_quality_ocr",
@@ -1981,12 +2001,13 @@ FAMILY_GATES: tuple[FamilyGate, ...] = (
         reason_no_path="missing_independent_presentation_evidence",
         reason_corroborating_only="visual_evidence_only",
         rationale=(
-            "One independent primary — slide structure, deck vocabulary or advertising "
-            "copy — *and* one visual corroboration. Pictures are corroboration, never a "
-            "case: all four visual rules share a scoring group so a picture-heavy page "
-            "cannot contribute the same evidence twice, and a document firing only "
-            "those rules is refused with ``visual_evidence_only`` at any threshold. A "
-            "page with too little recognised text to read is refused with "
+            "v7: deck vocabulary (``presentation_terms``) *and* one corroborating "
+            "visual or structural signal. The five visual/structural rules share one "
+            "scoring group, so no combination of them can sum — which is what let an "
+            "invoice and a form outscore the only true positive in v6 at 0.6562 against "
+            "0.625, a gap no threshold closes. ``marketing_copy`` corroborates but "
+            "cannot open the gate: on the development set it fired once, for an "
+            "invoice. A page with too little recognised text to read is refused with "
             "``insufficient_presentation_text`` — not classified for being short."
         ),
     ),
@@ -2009,7 +2030,12 @@ GATED_FAMILIES: frozenset[str] = frozenset(gate.family for gate in FAMILY_GATES)
 #: deliberately absent: those families' problem was precision, and a lower bar
 #: is the one change that cannot help it.
 FAMILY_CONFIDENCE_THRESHOLDS: dict[str, float] = {
-    "correspondence": 0.40,
+    # v7: 0.40 -> 0.42. Read off the same 270-document development split that
+    # produced the v6 value, so it is the same kind of candidate, not a
+    # firmer one: the family's rules, weights and gate are untouched. Do not
+    # re-tune it on these documents again — a threshold fitted twice to one
+    # split is fitted to that split, whatever the second reading shows.
+    "correspondence": 0.42,
     "form_structured": 0.40,
     "research_paper": 0.43,
     "resume": 0.30,
@@ -2025,10 +2051,35 @@ FAMILY_THRESHOLD_PROVENANCE: dict[str, str] = {
 #: alongside the overrides so the absence of an entry is legible as a decision
 #: rather than as an oversight.
 FAMILY_THRESHOLD_HOLDS: dict[str, str] = {
-    "presentation_marketing": "precision_limited_gate_rebuilt_in_v6",
+    "presentation_marketing": "precision_limited_gate_rebuilt_in_v7",
     "news_article": "precision_limited_paths_restricted_in_v6",
     "financial_document": "no_development_evidence_for_a_lower_bar",
 }
+
+#: Routing readiness, declared per family and reported in every result.
+#:
+#: No family is production-ready: every one of them is measured on a
+#: development split with no holdout, so the honest default is
+#: ``development_only``. Two are additionally withheld from automatic routing
+#: even in development, and stay withheld in v7 — ``presentation_marketing``
+#: because its gate has just been rebuilt for the second consecutive version,
+#: and ``financial_document`` because nothing in the development run examined
+#: its precision.
+#:
+#: This is metadata for the caller, not an input to any decision, so it is
+#: deliberately outside the rule fingerprint: changing it cannot change a
+#: classification.
+ROUTING_RELEASE_STATUS: dict[str, str] = {
+    **{family: "development_only" for family in SCORED_FAMILIES},
+    "presentation_marketing": "not_released_for_automatic_routing",
+    "financial_document": "not_released_for_automatic_routing",
+}
+
+FAMILIES_NOT_RELEASED_FOR_ROUTING: frozenset[str] = frozenset(
+    family
+    for family, status in ROUTING_RELEASE_STATUS.items()
+    if status == "not_released_for_automatic_routing"
+)
 
 
 def _path_rule_names(path: GatePath) -> set[str]:
@@ -2315,6 +2366,13 @@ def _rule_fingerprint() -> str:
     parts.append(f"family_thresholds:{sorted(FAMILY_CONFIDENCE_THRESHOLDS.items())}")
     parts.append(f"threshold_provenance:{sorted(FAMILY_THRESHOLD_PROVENANCE.items())}")
     parts.append(f"threshold_holds:{sorted(FAMILY_THRESHOLD_HOLDS.items())}")
+    # v7: the default operating point is part of the classifier's identity too.
+    # A run at a different global threshold, margin or OCR minimum is a
+    # different decision policy, and two reports carrying one fingerprint must
+    # mean one policy — including the defaults every caller inherits.
+    parts.append(f"global_confidence_threshold:{DEFAULT_CONFIDENCE_THRESHOLD:.6f}")
+    parts.append(f"global_min_score_margin:{DEFAULT_MIN_SCORE_MARGIN:.6f}")
+    parts.append(f"global_min_recognized_characters:{int(DEFAULT_MIN_RECOGNIZED_CHARACTERS)}")
     parts.append(f"press_release_policy:{PRESS_RELEASE_POLICY}")
     parts.append(f"scored_families:{list(SCORED_FAMILIES)}")
     digest = hashlib.sha1("\n".join(parts).encode("utf-8")).hexdigest()
@@ -2325,10 +2383,11 @@ def _rule_fingerprint() -> str:
 #: rule, a weight, a gate, a blocker or a family threshold moves it.
 RULE_FINGERPRINT = _rule_fingerprint()
 
-#: v6: visual evidence collapsed into one group, gate acceptance paths with
-#: declared refusal reasons, ``headline_body`` and ``bullet_layout`` removed,
-#: ``marketing_copy`` added, development-set family thresholds.
-CLASSIFIER_VERSION = f"rules-rvl-cdip-v6+{RULE_FINGERPRINT}"
+#: v7: ``slide_structure`` joins the substitutable visual group, the
+#: presentation gate requires deck vocabulary, ``marketing_copy`` no longer
+#: opens a path, correspondence moves to 0.42, and the global operating point
+#: enters the fingerprint.
+CLASSIFIER_VERSION = f"rules-rvl-cdip-v7+{RULE_FINGERPRINT}"
 
 
 def available_channels(features: dict) -> frozenset[str]:
@@ -2750,6 +2809,12 @@ def classify_with_rules(
             "minimum_score_margin": float(min_score_margin),
             "minimum_recognized_characters": int(min_recognized_characters),
         },
+        # Routing readiness of the family this result names. No family is
+        # production-ready; two are withheld from automatic routing entirely.
+        # Reported so a caller cannot act on a family the benchmark has not
+        # cleared without seeing that it has not been cleared.
+        "routing_release_status": ROUTING_RELEASE_STATUS.get(selected, "not_a_scored_family"),
+        "released_for_automatic_routing": False,
         "recommended_template": (
             FAMILY_TEMPLATES.get(selected) if mode == "auto" and decision["decision"] == "classified" else None
         ),
