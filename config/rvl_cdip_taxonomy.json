@@ -24,10 +24,10 @@
   "rejection_criterion": "Rejection targets are not classifier families: the only correct outcome is abstained or fallback.",
   "scientific_report_family": "technical_report",
   "press_release_policy": "not_news_article",
-  "pending_decisions": [
+  "decisions": [
     {
       "decision": "scientific_report_family",
-      "status": "pending",
+      "status": "accepted",
       "selected": "technical_report",
       "choices": [
         "technical_report",
@@ -36,11 +36,12 @@
       "affects": [
         "ground_truth"
       ],
-      "note": "RVL-CDIP 'scientific report' mixes institutional/laboratory reports with preprint-shaped documents. Changing this changes ground truth; metrics computed under different selections must not be pooled."
+      "note": "RVL-CDIP 'scientific report' mixes institutional/laboratory reports with preprint-shaped documents. Changing this changes ground truth; metrics computed under different selections must not be pooled.",
+      "accepted_in": "classifier v6"
     },
     {
       "decision": "press_release_policy",
-      "status": "pending",
+      "status": "accepted",
       "selected": "not_news_article",
       "choices": [
         "not_news_article",
@@ -49,7 +50,8 @@
       "affects": [
         "news_article_gate"
       ],
-      "note": "RVL-CDIP has no press-release class. Under 'not_news_article' press-release markers block the news_article gate; under 'news_article' they do not."
+      "note": "RVL-CDIP has no press-release class. Under 'not_news_article' press-release markers block the news_article gate; under 'news_article' they do not.",
+      "accepted_in": "classifier v6"
     }
   ],
   "label_mapping": {

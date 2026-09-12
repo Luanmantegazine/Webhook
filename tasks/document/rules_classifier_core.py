@@ -507,6 +507,8 @@ def classifier_versions() -> dict[str, Any]:
         "rule_count": len(RULE_IDS),
         "decision_group_count": DECISION_GROUP_COUNT,
         "family_confidence_thresholds": dict(FAMILY_CONFIDENCE_THRESHOLDS),
+        "family_threshold_provenance": dict(FAMILY_THRESHOLD_PROVENANCE),
+        "family_threshold_holds": dict(FAMILY_THRESHOLD_HOLDS),
         "taxonomy": taxonomy_descriptor(),
     }
 
@@ -1067,9 +1069,17 @@ _QUESTIONNAIRE_RE = re.compile(
     r"\bquestionnaire\b|^[ \t]*[\w ,'()-]{0,40}\bsurvey\b[ \t]*$",
     re.IGNORECASE | re.MULTILINE,
 )
+# v6 audit: the previous pattern fired 6 times on the development set with zero
+# positives. It matched the bare word "presentation" — which occurs in reports,
+# letters and papers alike — and mixed slide vocabulary with marketing copy, so
+# the rule's name described neither of the two things it measured. It is now
+# deck vocabulary in *heading position* plus explicit slide references; the
+# marketing half moved to its own rule, ``marketing_copy``.
 _PRESENTATION_TERM_RE = re.compile(
-    r"\b(?:agenda|presentation|our products?|limited time|special offer)\b",
-    re.IGNORECASE,
+    r"^[ \t]*(?:agenda|overview|outline|objectives?|key takeaways?|next steps|"
+    r"thank you|questions\??)[ \t]*[:.]?[ \t]*$"
+    r"|\bslide \d{1,2}\b|\bpresented (?:by|to)\b|\bpresentation (?:by|to|for)\b",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 
@@ -1255,81 +1265,87 @@ RULES: tuple[RuleSpec, ...] = (
         requires="geometry",
     ),
     # ---- presentation / advertisement -----------------------------------
-    # Presentation classification requires positive visual, list, or lexical
-    # evidence. Landscape orientation and picture dominance are alternative
-    # expressions of the same "visual page" evidence, so they share a group:
-    # a corpus of portrait-only scans no longer deflates this family's
-    # attainable score.
+    # v6. The development run accepted 41 documents as presentations and got 6
+    # right. Every false accept fired ``visual_layout`` *and*
+    # ``visual_dominance`` and landed on exactly 0.6333 — two readings of one
+    # picture-heavy page, summing into a decision as though they were two
+    # independent observations. All four visual rules therefore share one
+    # group: a page can supply the visual evidence once, however many ways it
+    # is measured. The gate then requires an *independent* primary signal on
+    # top of it (see FAMILY_GATES), so visual evidence alone can no longer
+    # decide the family at any threshold.
     _rule(
         "presentation_marketing",
         "visual_layout",
         lambda c: not _tables_dominate(c) and _visual_page(c),
-        group="visual_page",
+        group="visual_evidence",
         requires="layout",
     ),
+    # Audit: 0 firings on the development set, because RVL-CDIP scans are
+    # portrait. The rule measures what its name says and is kept for corpora
+    # that carry landscape pages; grouped with the other visual rules, it
+    # contributes no decision mass of its own.
     _rule(
         "presentation_marketing",
         "landscape_layout",
         lambda c: not _tables_dominate(c)
         and c.flt("landscape_ratio") >= 0.5
         and (c.num("relevant_picture_count") >= 2 or c.flt("picture_area_ratio") >= 0.25),
-        group="visual_page",
+        group="visual_evidence",
         requires="layout",
     ),
-    # "A short title over lists" — the slide shape. A title region is now
-    # required: list density with no title is a table of contents, an index, or
-    # an itemised form, none of which are presentations.
-    _rule(
-        "presentation_marketing",
-        "bullet_layout",
-        lambda c: not _tables_dominate(c)
-        and c.flt("list_density") >= 0.15
-        and c.num("word_count") <= 180
-        and c.flt("title_density") >= 0.02,
-    ),
-    _rule(
-        "presentation_marketing",
-        "slide_structure",
-        lambda c: not _tables_dominate(c)
-        and c.flt("landscape_ratio") >= 0.5
-        and c.flt("title_density") >= 0.05
-        and (
-            c.flt("list_density") >= 0.08
-            or c.flt("average_words_per_text_region") <= 20.0
-        ),
-        requires="layout",
-    ),
-    # Positive visual evidence stated directly: a large share of the page is
-    # picture *and* the text that is there is not narrative. Sparse text alone
-    # is not part of this rule — that was the path by which a short or
-    # low-quality OCR of any document became a "presentation".
     _rule(
         "presentation_marketing",
         "visual_dominance",
         lambda c: not _tables_dominate(c)
         and c.flt("picture_area_ratio") >= 0.25
         and c.flt("narrative_line_ratio") <= 0.25,
-        group="visual_density",
+        group="visual_evidence",
         requires="geometry",
     ),
-    # Corroborating vocabulary. Excluded from the family gate: an "agenda" line
-    # or a "special offer" is not on its own a reason to call a scan a slide.
-    _rule(
-        "presentation_marketing",
-        "presentation_terms",
-        lambda c: not _tables_dominate(c) and c.has(_PRESENTATION_TERM_RE),
-    ),
-    # Restricted: centred sparse text describes a title page, a handwritten
-    # note, a certificate and a failed OCR just as well as a slide, so it now
-    # requires the landscape or pictorial evidence that distinguishes them.
     _rule(
         "presentation_marketing",
         "sparse_centered",
         lambda c: c.flt("centered_line_ratio") >= 0.30
         and c.num("word_line_count") <= 25
         and (c.flt("landscape_ratio") >= 0.5 or c.num("relevant_picture_count") >= 1),
-        group="visual_density",
+        group="visual_evidence",
         requires="geometry",
+    ),
+    # Primary, structural. v6 audit: the previous version required landscape
+    # orientation and fired 0 times, so a rule named for slide structure was in
+    # fact measuring page orientation. It now measures the slide shape itself —
+    # a titled page of short, listed text — and treats landscape as one way of
+    # satisfying the shape rather than a precondition. ``bullet_layout`` was
+    # removed: "a short title over lists" is this same observation, and two
+    # rules measuring it summed into the decision twice.
+    _rule(
+        "presentation_marketing",
+        "slide_structure",
+        lambda c: not _tables_dominate(c)
+        and c.flt("title_density") >= 0.05
+        and c.num("word_count") <= 180
+        and (
+            c.flt("list_density") >= 0.10
+            or c.flt("average_words_per_text_region") <= 12.0
+        ),
+        requires="layout",
+    ),
+    # Primary, lexical: deck vocabulary in heading position. See the pattern
+    # note above for what the previous version actually matched.
+    _rule(
+        "presentation_marketing",
+        "presentation_terms",
+        lambda c: not _tables_dominate(c) and c.has(_PRESENTATION_TERM_RE),
+    ),
+    # Primary, lexical: advertising copy. RVL-CDIP maps ``advertisement`` to
+    # this family, so two independent marketing phrases are positive evidence
+    # for it — and are the half of the old ``presentation_terms`` that actually
+    # described a document type.
+    _rule(
+        "presentation_marketing",
+        "marketing_copy",
+        lambda c: not _tables_dominate(c) and c.num("marketing_term_count") >= 2,
     ),
     # ---- correspondence (letter / memo / e-mail) -------------------------
     _rule("correspondence", "header_block", lambda c: c.num("correspondence_header_count") >= 2),
@@ -1388,17 +1404,13 @@ RULES: tuple[RuleSpec, ...] = (
         group="news_layout",
         requires="geometry",
     ),
-    # Headline over a long running body: a titled region on a page whose body
-    # is narrative and neither tabular nor pictorial.
-    _rule(
-        "news_article",
-        "headline_body",
-        lambda c: c.flt("title_density") >= 0.02
-        and c.num("word_count") >= 250
-        and c.flt("table_area_ratio") < 0.25
-        and c.flt("picture_area_ratio") < 0.35,
-        requires="layout",
-    ),
+    # ``headline_body`` was removed in v6. It fired six times on the
+    # development set and not one of them was a news article: "a titled region
+    # over 250 words that is neither a table nor a picture" describes most
+    # typed pages, so the rule's name claimed evidence its implementation never
+    # measured. Nothing replaces it until there is a measurement of headline
+    # typography (relative type size, position, single-line span) to build it
+    # from — the feature record carries none today.
 )
 
 RULE_IDS: tuple[str, ...] = tuple(rule.rule_id for rule in RULES)
@@ -1453,13 +1465,18 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     "form_structured.label_value_lines": 0.14,
     "form_structured.tab_stop_alignment": 0.10,
     "form_structured.field_geometry_regularity": 0.08,
+    # One visual group (capacity 0.22) plus two lexical primaries and one
+    # structural primary. Decision mass is 0.64, so the minimum accepting case
+    # — one primary with one visual corroboration — lands just above the global
+    # 0.60 threshold, and visual evidence on its own reaches 0.34 before the
+    # gate zeroes it. The family's threshold is deliberately *not* lowered.
     "presentation_marketing.visual_layout": 0.22,
     "presentation_marketing.landscape_layout": 0.16,
-    "presentation_marketing.slide_structure": 0.18,
     "presentation_marketing.visual_dominance": 0.16,
-    "presentation_marketing.bullet_layout": 0.12,
-    "presentation_marketing.presentation_terms": 0.20,
     "presentation_marketing.sparse_centered": 0.12,
+    "presentation_marketing.slide_structure": 0.20,
+    "presentation_marketing.presentation_terms": 0.18,
+    "presentation_marketing.marketing_copy": 0.22,
     "correspondence.header_block": 0.30,
     "correspondence.salutation": 0.24,
     "correspondence.closing": 0.18,
@@ -1478,7 +1495,6 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     "news_article.attribution_quotes": 0.16,
     "news_article.multi_column_body": 0.16,
     "news_article.justified_body": 0.16,
-    "news_article.headline_body": 0.12,
 }
 
 
@@ -1603,26 +1619,50 @@ def _press_release_evidence(ctx: _Context) -> bool:
     return ctx.num("press_release_marker_count") >= 1
 
 
-def _sparse_or_low_quality_ocr(ctx: _Context) -> bool:
-    """Little text, or text the OCR is not confident about.
+def _low_quality_ocr(ctx: _Context) -> bool:
+    """Text the OCR itself is not confident about, on a page with no visuals.
 
-    This is emphatically *not* evidence for any family. A handwritten page, a
-    dark scan and a failed binarisation all produce it, and the previous rule
-    set let it act as positive evidence for ``presentation_marketing`` because
-    slides also happen to be short. Used only as a guard.
+    This is emphatically not evidence for any family: a dark scan, a failed
+    binarisation and a handwritten page all produce it. v6 narrowed it to the
+    *confidence* reading — "few words" moved to
+    :func:`_presentation_text_too_sparse`, where it belongs, because the two
+    were being reported under one name and a short slide was refused for
+    looking like a bad scan.
     """
-    sparse = ctx.num("word_count") <= 60 or ctx.num("alnum_character_count") <= 200
     word_confidence = ctx.opt("word_confidence_mean")
     layout_confidence = ctx.opt("layout_confidence_mean")
     low_quality = (word_confidence is not None and word_confidence < 0.55) or (
         layout_confidence is not None and layout_confidence < 0.35
     )
-    if not (sparse or low_quality):
+    if not low_quality:
         return False
     return not _visual_page(ctx) and ctx.flt("landscape_ratio") < 0.5
 
 
+def _presentation_text_too_sparse(ctx: _Context) -> bool:
+    """Too little recognised text to support a presentation claim.
+
+    A slide carries at least a title and a line or two under it. Below that
+    there is nothing to read, and "short" is not a document family: the page is
+    as likely to be a photograph, a cover sheet or a failed binarisation. Stated
+    as its own guard so the refusal reports ``insufficient_presentation_text``
+    rather than an unexplained low score.
+
+    The bar is deliberately low. Slides *are* short — a title and three bullets
+    is eight words — so this guard only catches pages with effectively no
+    recognised text. What keeps short picture pages out of the family is the
+    gate's demand for independent primary evidence, not this threshold; raising
+    it to do that work would refuse the genuine slides along with them.
+    """
+    return ctx.num("word_count") < 6 or ctx.num("alnum_character_count") < 25
+
+
 BLOCKERS: tuple[Blocker, ...] = (
+    Blocker(
+        "presentation_text_too_sparse",
+        _presentation_text_too_sparse,
+        "Fewer than 12 words or 50 alphanumeric characters recognised.",
+    ),
     Blocker("invoice_evidence", _invoice_evidence, "Billing document: at least two invoice signals."),
     Blocker(
         "technical_specification_evidence",
@@ -1654,68 +1694,137 @@ BLOCKERS: tuple[Blocker, ...] = (
         "Press-release markers; active only under press_release_policy=not_news_article.",
     ),
     Blocker(
-        "sparse_or_low_quality_ocr",
-        _sparse_or_low_quality_ocr,
-        "Short or low-confidence OCR with no visual evidence; never positive evidence.",
+        "low_quality_ocr",
+        _low_quality_ocr,
+        "Low-confidence OCR with no visual evidence; never positive evidence.",
     ),
 )
 
 BLOCKER_PREDICATES: dict[str, Blocker] = {blocker.name: blocker for blocker in BLOCKERS}
 
 
+class GatePath(NamedTuple):
+    """One way a family may become decidable.
+
+    A path is satisfied when all three of its clauses are — any clause left
+    empty is trivially satisfied:
+
+    ``all_of``
+        Every named rule must have fired.
+    ``any_of``
+        Each pool contributes at least one fired rule.
+    ``min_units``
+        ``(n, units)``: at least ``n`` distinct *units* fired, where a unit is a
+        tuple of rules that are alternative readings of one observation. Units,
+        not rules, are what "independent evidence" counts — an abstract heading
+        and a references heading are one structural observation seen twice.
+
+    Several paths per family is the point: "a questionnaire heading with one
+    structural signal" and "a form heading with two corroborating signals" are
+    different cases with different evidence bars, and writing them as one
+    threshold over a bag of rules loses exactly that distinction.
+    """
+
+    name: str
+    all_of: tuple[str, ...] = ()
+    any_of: tuple[tuple[str, ...], ...] = ()
+    min_units: tuple[tuple[int, tuple[tuple[str, ...], ...]], ...] = ()
+
+
 class FamilyGate(NamedTuple):
     """Declarative acceptance requirement for one family.
 
-    ``groups``
-        Independent evidence groups, ``(group_name, rule_names)``. Two rules in
-        the same group are two ways of seeing one thing and count once.
-    ``min_groups``
-        How many distinct groups must fire for the family to be decidable.
-    ``sufficient_rules``
-        Rules strong enough to satisfy the gate alone.
-    ``required_any_groups``
-        When non-empty, at least one of these groups must be among those that
-        fired, whatever ``min_groups`` says.
-    ``corroborating``
-        Rules that add score but can never open a decision.
-    ``blockers``
-        Named guards; any one of them firing vetoes the family outright.
-    ``confidence_threshold``
-        Optional family-specific operating point. Declared here, resolved by
-        :func:`resolve_family_thresholds`, and reported in the result. It is an
-        offset from the global threshold, never a replacement for it.
+    ``paths``
+        Alternative acceptance routes; the gate opens when any one is
+        satisfied.
+    ``primary`` / ``corroborating``
+        Every rule of the family, split by what it may do. A corroborating rule
+        can support a case but never open one, and a document that fires only
+        corroborating rules is reported with ``reason_corroborating_only`` —
+        the ``visual_evidence_only`` diagnosis that names the v5 failure.
+    ``blockers`` / ``blocker_reasons``
+        Named guards, and the refusal reason each maps to, so the reason a
+        family was refused is a declared string rather than something a reader
+        has to reconstruct.
+    ``reason_no_path``
+        Refusal reason when nothing fired at all.
+
+    Family thresholds are *not* declared here: they live in
+    :data:`FAMILY_CONFIDENCE_THRESHOLDS` with their provenance, because a
+    threshold is a calibration result and a gate is a statement about evidence.
     """
 
     family: str
-    groups: tuple[tuple[str, tuple[str, ...]], ...]
-    min_groups: int
-    sufficient_rules: frozenset[str]
-    required_any_groups: frozenset[str]
+    paths: tuple[GatePath, ...]
+    primary: tuple[str, ...]
     corroborating: tuple[str, ...]
     blockers: tuple[str, ...]
-    confidence_threshold: float | None
+    blocker_reasons: tuple[tuple[str, str], ...]
+    reason_no_path: str
+    reason_corroborating_only: str
     rationale: str
+
+
+#: The structural signals a form may be corroborated by. Named once: the gate
+#: paths below all draw from this pool, and the "one structural signal" of
+#: paths A and B is the same pool as the "two corroborating signals" of path C.
+_FORM_STRUCTURAL_SIGNALS: tuple[str, ...] = (
+    "field_labels",
+    "label_value_lines",
+    "tab_stop_alignment",
+    "field_geometry_regularity",
+    "short_field_regions",
+    "blank_fields",
+)
+
+_CORRESPONDENCE_SIGNALS: tuple[str, ...] = (
+    "header_block",
+    "email_markers",
+    "salutation",
+    "closing",
+    "memo_heading",
+    "letter_geometry",
+    "letter_body",
+)
+
+_PRESENTATION_PRIMARY: tuple[str, ...] = (
+    "slide_structure",
+    "presentation_terms",
+    "marketing_copy",
+)
+_PRESENTATION_VISUAL: tuple[str, ...] = (
+    "visual_layout",
+    "landscape_layout",
+    "visual_dominance",
+    "sparse_centered",
+)
 
 
 FAMILY_GATES: tuple[FamilyGate, ...] = (
     FamilyGate(
         family="form_structured",
-        groups=(
-            ("form_heading", ("form_heading",)),
-            ("questionnaire_heading", ("questionnaire_heading",)),
-            ("checkboxes", ("checkboxes",)),
-            ("blank_fields", ("blank_fields",)),
+        # Three explicit paths rather than a count over a bag of rules. No path
+        # is satisfiable by structure alone: the broad ``field_grid`` rule is
+        # not reintroduced, and geometry never opens a decision.
+        paths=(
+            GatePath(
+                name="A_questionnaire_with_structure",
+                all_of=("questionnaire_heading",),
+                any_of=(_FORM_STRUCTURAL_SIGNALS,),
+            ),
+            GatePath(
+                name="B_checkboxes_with_structure",
+                all_of=("checkboxes",),
+                any_of=(_FORM_STRUCTURAL_SIGNALS,),
+            ),
+            GatePath(
+                name="C_form_heading_with_two_corroborations",
+                all_of=("form_heading",),
+                min_units=((2, tuple((name,) for name in _FORM_STRUCTURAL_SIGNALS)),),
+            ),
         ),
-        min_groups=2,
-        sufficient_rules=frozenset({"form_heading", "questionnaire_heading"}),
-        required_any_groups=frozenset(),
-        corroborating=(
-            "field_labels",
-            "short_field_regions",
-            "label_value_lines",
-            "tab_stop_alignment",
-            "field_geometry_regularity",
-        ),
+        primary=("form_heading", "questionnaire_heading", "checkboxes"),
+        corroborating=_FORM_STRUCTURAL_SIGNALS,
         blockers=(
             "invoice_evidence",
             "technical_specification_evidence",
@@ -1724,84 +1833,110 @@ FAMILY_GATES: tuple[FamilyGate, ...] = (
             "budget_evidence",
             "resume_evidence",
         ),
-        confidence_threshold=None,
+        blocker_reasons=(),
+        reason_no_path="missing_form_primary_evidence",
+        reason_corroborating_only="form_structure_only",
         rationale=(
-            "One strong primary (a form or questionnaire heading) or two independent "
-            "primaries (checkboxes, blank fields). Labelled lines, short regions, tab "
-            "stops and geometric regularity corroborate only: every one of them is also "
-            "produced by invoices, specifications, budgets, resumes, advertisements and "
-            "columned news pages, which is where the family's false positives came from."
+            "Paths A and B — a questionnaire heading or checkboxes, each with one "
+            "independent structural signal — identified 5 forms and no negatives on the "
+            "development set. That is a regression test, not a generalisation claim. "
+            "Path C requires two corroborations behind a form heading. Structural "
+            "signals never open a path on their own: in isolation their precision on "
+            "the development set was very low, which is what the removed ``field_grid`` "
+            "rule measured."
         ),
     ),
     FamilyGate(
         family="correspondence",
-        # Each signal is its own group: a salutation at the top of a page and a
-        # closing at the bottom are two independent observations, not two
-        # spellings of one. Grouping them cost exactly the coverage this family
-        # is meant to gain — an ordinary "Dear ... Sincerely" letter carrying no
-        # routing header fired one group and was refused.
-        groups=(
-            ("header_block", ("header_block",)),
-            ("email_markers", ("email_markers",)),
-            ("salutation", ("salutation",)),
-            ("closing", ("closing",)),
-            ("memo_heading", ("memo_heading",)),
-            ("letter_geometry", ("letter_geometry",)),
-            ("letter_body", ("letter_body",)),
+        paths=(
+            GatePath(
+                name="two_independent_signals",
+                min_units=((2, tuple((name,) for name in _CORRESPONDENCE_SIGNALS)),),
+            ),
         ),
-        min_groups=2,
-        sufficient_rules=frozenset(),
-        required_any_groups=frozenset(),
+        primary=_CORRESPONDENCE_SIGNALS,
         corroborating=(),
         blockers=("form_evidence", "news_reporting_evidence"),
-        confidence_threshold=0.50,
+        blocker_reasons=(),
+        reason_no_path="fewer_than_two_correspondence_signals",
+        reason_corroborating_only="",
         rationale=(
             "Two independent signals accept, even when each is individually weak — a "
             "salutation with a closing, or an e-mail marker with letter geometry, is a "
-            "letter. Coverage is bought with the family threshold declared here, not by "
-            "lowering the global threshold for every family. ``letter_body`` cannot "
-            "reach the bar on its own: it only fires when a primary signal is already "
-            "present, and a letter carrying nothing but a routing header and the shape "
-            "of a letter still scores below the family threshold."
+            "letter. ``letter_body`` only fires when a primary signal is already "
+            "present, so it cannot manufacture the second signal on its own."
         ),
     ),
     FamilyGate(
         family="research_paper",
-        groups=(
-            (
-                "academic_structure",
-                ("abstract_heading", "references_heading", "academic_section_headings"),
+        paths=(
+            GatePath(
+                name="two_independent_academic_groups",
+                min_units=(
+                    (
+                        2,
+                        (
+                            (
+                                "abstract_heading",
+                                "references_heading",
+                                "academic_section_headings",
+                            ),
+                            ("doi", "citations"),
+                            ("editorial_dates", "authors_affiliations"),
+                            ("two_column_layout", "justified_body", "formula_layout"),
+                        ),
+                    ),
+                ),
             ),
-            ("citation_evidence", ("doi", "citations")),
-            ("editorial_metadata", ("editorial_dates", "authors_affiliations")),
-            ("academic_layout", ("two_column_layout", "justified_body", "formula_layout")),
         ),
-        min_groups=2,
-        sufficient_rules=frozenset(),
-        required_any_groups=frozenset(),
+        primary=(
+            "abstract_heading",
+            "references_heading",
+            "academic_section_headings",
+            "doi",
+            "citations",
+            "editorial_dates",
+            "authors_affiliations",
+            "two_column_layout",
+            "justified_body",
+            "formula_layout",
+        ),
         corroborating=("academic_vocabulary",),
         blockers=("news_reporting_evidence", "invoice_evidence", "form_evidence"),
-        confidence_threshold=None,
+        blocker_reasons=(),
+        reason_no_path="fewer_than_two_academic_groups",
+        reason_corroborating_only="academic_vocabulary_only",
         rationale=(
             "Two independent groups: structure with citations, structure with editorial "
             "metadata, or citations with academic layout. Generic vocabulary is "
-            "corroborating only, so 'results', 'method', 'study' or a bare date can never "
-            "decide the family."
+            "corroborating only, so 'results', 'method', 'study' or a bare date can "
+            "never decide the family."
         ),
     ),
     FamilyGate(
         family="news_article",
-        groups=(
-            ("journalistic_source", ("byline", "wire_service")),
-            ("dateline", ("dateline",)),
-            ("reported_speech", ("attribution_quotes",)),
-            ("news_layout", ("multi_column_body", "justified_body")),
-            ("headline_body", ("headline_body",)),
+        # v6. The development set offered exactly one safe combination —
+        # byline with reported speech or a justified body — which found three
+        # news articles and no negatives. ``byline + multi_column_body`` and
+        # ``wire_service + attribution_quotes`` are explicitly *not* paths:
+        # both admitted advertisements and scientific publications, because a
+        # column count is a typesetting fact and an attribution verb is a
+        # narrative one. Neither pair can satisfy any path below without a
+        # third, independent signal.
+        paths=(
+            GatePath(
+                name="byline_with_reporting",
+                all_of=("byline",),
+                any_of=(("attribution_quotes", "justified_body"),),
+            ),
+            GatePath(
+                name="wire_and_dateline_with_reporting",
+                all_of=("wire_service", "dateline"),
+                any_of=(("attribution_quotes", "justified_body"),),
+            ),
         ),
-        min_groups=2,
-        sufficient_rules=frozenset(),
-        required_any_groups=frozenset({"journalistic_source", "dateline", "news_layout"}),
-        corroborating=(),
+        primary=("byline", "wire_service", "dateline"),
+        corroborating=("attribution_quotes", "multi_column_body", "justified_body"),
         blockers=(
             "research_publication_evidence",
             "advertisement_evidence",
@@ -1809,36 +1944,50 @@ FAMILY_GATES: tuple[FamilyGate, ...] = (
             "correspondence_evidence",
             "press_release_evidence",
         ),
-        confidence_threshold=None,
+        blocker_reasons=(),
+        reason_no_path="missing_independent_news_evidence",
+        reason_corroborating_only="news_layout_or_attribution_only",
         rationale=(
-            "A byline, an attribution or a column count alone decides nothing: two groups "
-            "are required, one of which must be a journalistic source, a dateline or the "
-            "news layout. Guards keep scientific publications, advertisements, forms, "
-            "institutional correspondence and press releases out of the family."
+            "Only byline-with-reporting is validated on the development set. The "
+            "wire-and-dateline path demands three independent journalistic signals and "
+            "is **not** validated — it exists so a wire story without a byline is not "
+            "structurally unreachable, and it is the first thing to remove if news "
+            "precision regresses."
         ),
     ),
     FamilyGate(
         family="presentation_marketing",
-        groups=(
-            ("visual_page", ("visual_layout", "landscape_layout")),
-            ("slide_structure", ("slide_structure",)),
-            ("title_with_lists", ("bullet_layout",)),
-            ("visual_density", ("visual_dominance", "sparse_centered")),
+        # v6. The whole family is rebuilt around one finding: on the
+        # development set 41 documents were accepted and 6 were right, and
+        # every false accept was visual evidence and nothing else.
+        paths=(
+            GatePath(
+                name="independent_primary_with_visual_support",
+                any_of=(_PRESENTATION_PRIMARY, _PRESENTATION_VISUAL),
+            ),
         ),
-        min_groups=1,
-        sufficient_rules=frozenset(),
-        required_any_groups=frozenset(
-            {"visual_page", "slide_structure", "title_with_lists", "visual_density"}
+        primary=_PRESENTATION_PRIMARY,
+        corroborating=_PRESENTATION_VISUAL,
+        blockers=(
+            "presentation_text_too_sparse",
+            "low_quality_ocr",
+            "form_evidence",
+            "invoice_evidence",
         ),
-        corroborating=("presentation_terms",),
-        blockers=("sparse_or_low_quality_ocr", "form_evidence", "invoice_evidence"),
-        confidence_threshold=None,
+        blocker_reasons=(
+            ("presentation_text_too_sparse", "insufficient_presentation_text"),
+            ("low_quality_ocr", "insufficient_presentation_text"),
+        ),
+        reason_no_path="missing_independent_presentation_evidence",
+        reason_corroborating_only="visual_evidence_only",
         rationale=(
-            "Positive visual evidence is required: relevant pictures, a landscape slide "
-            "structure, a short title over lists, or high visual area against low "
-            "narrative density. Short text, sparse text and low-quality OCR are guards, "
-            "never evidence, so a handwritten page is not a presentation for having "
-            "little text on it."
+            "One independent primary — slide structure, deck vocabulary or advertising "
+            "copy — *and* one visual corroboration. Pictures are corroboration, never a "
+            "case: all four visual rules share a scoring group so a picture-heavy page "
+            "cannot contribute the same evidence twice, and a document firing only "
+            "those rules is refused with ``visual_evidence_only`` at any threshold. A "
+            "page with too little recognised text to read is refused with "
+            "``insufficient_presentation_text`` — not classified for being short."
         ),
     ),
 )
@@ -1848,20 +1997,56 @@ GATED_FAMILIES: frozenset[str] = frozenset(gate.family for gate in FAMILY_GATES)
 #: Family-specific operating points, declared once and reported in every
 #: result. They are *offsets* from the global threshold (see
 #: :func:`resolve_family_thresholds`), so sweeping the global threshold still
-#: moves every family and the risk-coverage curve stays meaningful.
+#: moves every family and the risk-coverage curve stays meaningful; at the
+#: module default of 0.60 they resolve to exactly the values written here.
+#:
+#: **These are development-set candidates, not calibrated thresholds.** They
+#: were read off the development split and have not been tested on a holdout;
+#: :data:`FAMILY_THRESHOLD_PROVENANCE` carries that status into every report so
+#: no reader can mistake them for a calibration result.
+#:
+#: ``presentation_marketing``, ``news_article`` and ``financial_document`` are
+#: deliberately absent: those families' problem was precision, and a lower bar
+#: is the one change that cannot help it.
 FAMILY_CONFIDENCE_THRESHOLDS: dict[str, float] = {
-    gate.family: float(gate.confidence_threshold)
-    for gate in FAMILY_GATES
-    if gate.confidence_threshold is not None
+    "correspondence": 0.40,
+    "form_structured": 0.40,
+    "research_paper": 0.43,
+    "resume": 0.30,
+    "technical_report": 0.31,
 }
+
+FAMILY_THRESHOLD_PROVENANCE: dict[str, str] = {
+    family: "development_set_candidate_requires_holdout"
+    for family in FAMILY_CONFIDENCE_THRESHOLDS
+}
+
+#: Families held at the global threshold on purpose, with the reason. Reported
+#: alongside the overrides so the absence of an entry is legible as a decision
+#: rather than as an oversight.
+FAMILY_THRESHOLD_HOLDS: dict[str, str] = {
+    "presentation_marketing": "precision_limited_gate_rebuilt_in_v6",
+    "news_article": "precision_limited_paths_restricted_in_v6",
+    "financial_document": "no_development_evidence_for_a_lower_bar",
+}
+
+
+def _path_rule_names(path: GatePath) -> set[str]:
+    names = set(path.all_of)
+    for pool in path.any_of:
+        names.update(pool)
+    for _count, units in path.min_units:
+        for unit in units:
+            names.update(unit)
+    return names
 
 
 def _validate_gate_configuration() -> None:
     """Refuse to import a gate table that does not describe the rule set.
 
     A gate naming a rule that no longer exists silently stops constraining the
-    family it was written for, which is the failure mode this check exists to
-    make impossible.
+    family it was written for, and a rule that no gate classifies is evidence
+    nobody decided the status of. Both are import errors.
     """
     rules_by_family: dict[str, set[str]] = {}
     for rule in RULES:
@@ -1870,39 +2055,79 @@ def _validate_gate_configuration() -> None:
         known = rules_by_family.get(gate.family)
         if not known:
             raise ValueError(f"gate declared for unknown family {gate.family!r}")
-        grouped = [name for _group, names in gate.groups for name in names]
-        if len(grouped) != len(set(grouped)):
-            raise ValueError(f"{gate.family}: a rule appears in more than one gate group")
-        covered = set(grouped) | set(gate.corroborating)
-        unknown = sorted(covered - known)
-        if unknown:
-            raise ValueError(f"{gate.family}: gate references unknown rule(s) {unknown}")
-        uncovered = sorted(known - covered)
-        if uncovered:
-            raise ValueError(
-                f"{gate.family}: rule(s) {uncovered} are neither gate evidence nor "
-                "corroborating; every rule of a gated family must be classified"
-            )
-        overlap = sorted(set(grouped) & set(gate.corroborating))
+        classified = set(gate.primary) | set(gate.corroborating)
+        overlap = sorted(set(gate.primary) & set(gate.corroborating))
         if overlap:
             raise ValueError(f"{gate.family}: rule(s) {overlap} are both primary and corroborating")
-        unknown_sufficient = sorted(gate.sufficient_rules - set(grouped))
-        if unknown_sufficient:
+        unknown = sorted(classified - known)
+        if unknown:
+            raise ValueError(f"{gate.family}: gate references unknown rule(s) {unknown}")
+        unclassified = sorted(known - classified)
+        if unclassified:
             raise ValueError(
-                f"{gate.family}: sufficient rule(s) {unknown_sufficient} are not gate evidence"
+                f"{gate.family}: rule(s) {unclassified} are neither primary nor "
+                "corroborating; every rule of a gated family must be classified"
             )
-        group_names = {name for name, _rules in gate.groups}
-        unknown_required = sorted(gate.required_any_groups - group_names)
-        if unknown_required:
-            raise ValueError(f"{gate.family}: required group(s) {unknown_required} do not exist")
-        if gate.min_groups < 1 or gate.min_groups > len(gate.groups):
-            raise ValueError(f"{gate.family}: min_groups is outside the declared groups")
+        if not gate.paths:
+            raise ValueError(f"{gate.family}: a gate must declare at least one path")
+        for path in gate.paths:
+            missing = sorted(_path_rule_names(path) - known)
+            if missing:
+                raise ValueError(f"{gate.family}/{path.name}: unknown rule(s) {missing}")
+            if not (path.all_of or path.any_of or path.min_units):
+                raise ValueError(f"{gate.family}/{path.name}: path has no requirements")
+            for pool in path.any_of:
+                if not pool:
+                    raise ValueError(f"{gate.family}/{path.name}: empty any_of pool")
+            for count, units in path.min_units:
+                if count < 1 or count > len(units):
+                    raise ValueError(
+                        f"{gate.family}/{path.name}: min_units count {count} is outside "
+                        f"the {len(units)} declared units"
+                    )
         unknown_blockers = sorted(set(gate.blockers) - set(BLOCKER_PREDICATES))
         if unknown_blockers:
             raise ValueError(f"{gate.family}: unknown blocker(s) {unknown_blockers}")
+        unmapped = sorted(
+            {name for name, _reason in gate.blocker_reasons} - set(gate.blockers)
+        )
+        if unmapped:
+            raise ValueError(f"{gate.family}: blocker_reasons name non-blockers {unmapped}")
+    unknown_threshold_families = sorted(
+        set(FAMILY_CONFIDENCE_THRESHOLDS) - set(SCORED_FAMILIES)
+    )
+    if unknown_threshold_families:
+        raise ValueError(
+            f"family thresholds declared for unscored families: {unknown_threshold_families}"
+        )
+    if set(FAMILY_THRESHOLD_PROVENANCE) != set(FAMILY_CONFIDENCE_THRESHOLDS):
+        raise ValueError("every family threshold must declare its provenance")
+    both = sorted(set(FAMILY_THRESHOLD_HOLDS) & set(FAMILY_CONFIDENCE_THRESHOLDS))
+    if both:
+        raise ValueError(f"families {both} are declared as both overridden and held")
 
 
 _validate_gate_configuration()
+
+
+def _evaluate_path(path: GatePath, fired: set[str]) -> tuple[bool, list[str]]:
+    """Return whether a path is satisfied, and what it is missing if not."""
+    unmet: list[str] = []
+    for name in path.all_of:
+        if name not in fired:
+            unmet.append(f"requires {name}")
+    for pool in path.any_of:
+        if not any(name in fired for name in pool):
+            unmet.append("requires one of " + "/".join(pool))
+    for count, units in path.min_units:
+        satisfied_units = sum(
+            1 for unit in units if any(name in fired for name in unit)
+        )
+        if satisfied_units < count:
+            unmet.append(
+                f"requires {count} independent units, {satisfied_units} fired"
+            )
+    return (not unmet), unmet
 
 
 def evaluate_family_gates(
@@ -1912,26 +2137,32 @@ def evaluate_family_gates(
     """Evaluate every declared gate into an auditable per-family record.
 
     Pure and separate from scoring: the returned record says *why* a family may
-    or may not be decided, and :func:`classify_with_rules` is the only place
-    that acts on it.
+    or may not be decided — which path opened, what the unsatisfied paths were
+    missing, which guard vetoed it — and :func:`classify_with_rules` is the only
+    place that acts on it. Every refusal carries a declared ``reason`` string so
+    error analysis can group refusals without re-deriving them from scores.
     """
     ctx = _Context(features)
     channels = available_channels(features)
     report: dict[str, dict] = {}
     for gate in FAMILY_GATES:
-        fired_groups: list[str] = []
-        fired_rules: list[str] = []
-        for group_name, rule_names in gate.groups:
-            hits = [name for name in rule_names if indicators.get(f"{gate.family}.{name}")]
-            if hits:
-                fired_groups.append(group_name)
-                fired_rules.extend(hits)
-        sufficient = sorted(
-            name for name in gate.sufficient_rules if indicators.get(f"{gate.family}.{name}")
-        )
-        corroborating = sorted(
-            name for name in gate.corroborating if indicators.get(f"{gate.family}.{name}")
-        )
+        fired = {
+            name
+            for name in (*gate.primary, *gate.corroborating)
+            if indicators.get(f"{gate.family}.{name}")
+        }
+        primary_fired = sorted(name for name in gate.primary if name in fired)
+        corroborating_fired = sorted(name for name in gate.corroborating if name in fired)
+
+        satisfied_paths: list[str] = []
+        unsatisfied_paths: dict[str, list[str]] = {}
+        for path in gate.paths:
+            ok, unmet = _evaluate_path(path, fired)
+            if ok:
+                satisfied_paths.append(path.name)
+            else:
+                unsatisfied_paths[path.name] = unmet
+
         blocked_by = []
         for name in gate.blockers:
             blocker = BLOCKER_PREDICATES[name]
@@ -1941,30 +2172,35 @@ def evaluate_family_gates(
             except Exception:  # a malformed feature must not abort classification
                 continue
 
-        meets_required = (
-            not gate.required_any_groups
-            or bool(gate.required_any_groups & set(fired_groups))
-        )
-        satisfied = bool(sufficient) or (
-            len(fired_groups) >= gate.min_groups and meets_required
-        )
+        blocker_reasons = dict(gate.blocker_reasons)
         if blocked_by:
             status = "blocked"
-        elif satisfied:
+            reason = blocker_reasons.get(blocked_by[0], f"blocked_by_{blocked_by[0]}")
+        elif satisfied_paths:
             status = "satisfied"
+            reason = f"path_{satisfied_paths[0]}"
+        elif corroborating_fired and not primary_fired and gate.reason_corroborating_only:
+            # The v5 failure mode, named: evidence of the right shape but of
+            # only one kind, which is a refusal and not a low score.
+            status = "blocked"
+            reason = gate.reason_corroborating_only
         else:
             status = "insufficient_evidence"
+            reason = gate.reason_no_path
+
         report[gate.family] = {
             "status": status,
-            "required_group_count": gate.min_groups,
-            "fired_groups": fired_groups,
-            "fired_primary_rules": sorted(fired_rules),
-            "sufficient_rules_fired": sufficient,
-            "corroborating_fired": corroborating,
-            "required_any_groups": sorted(gate.required_any_groups),
+            "reason": reason,
+            "satisfied_paths": satisfied_paths,
+            "unsatisfied_paths": unsatisfied_paths,
+            "primary_fired": primary_fired,
+            "corroborating_fired": corroborating_fired,
             "blocked_by": blocked_by,
             "available_channels": sorted(channels),
-            "family_confidence_threshold": gate.confidence_threshold,
+            "declared_family_threshold": FAMILY_CONFIDENCE_THRESHOLDS.get(gate.family),
+            "threshold_provenance": FAMILY_THRESHOLD_PROVENANCE.get(
+                gate.family, FAMILY_THRESHOLD_HOLDS.get(gate.family, "global_threshold")
+            ),
             "rationale": gate.rationale,
         }
     return report
@@ -1989,6 +2225,25 @@ def resolve_family_thresholds(
         offset = float(value) - DEFAULT_CONFIDENCE_THRESHOLD
         resolved[family] = round(max(0.0, global_threshold + offset), 6)
     return resolved
+
+
+def effective_family_threshold(
+    family: str,
+    confidence_threshold: float,
+    family_thresholds: dict[str, float] | None = None,
+) -> float:
+    """The threshold one family is actually judged against.
+
+    Separate from the global threshold on purpose: reporting only the global
+    value beside a decision taken at a family's own bar is how a lower bar
+    becomes invisible in a benchmark table.
+    """
+    resolved = (
+        resolve_family_thresholds(confidence_threshold)
+        if family_thresholds is None
+        else family_thresholds
+    )
+    return float(resolved.get(family, float(confidence_threshold)))
 
 
 def _code_signature(code: CodeType) -> str:
@@ -2050,14 +2305,16 @@ def _rule_fingerprint() -> str:
     # did apply the same rules *and* the same acceptance requirements.
     for gate in FAMILY_GATES:
         parts.append(
-            f"gate:{gate.family}|{gate.groups}|{gate.min_groups}|"
-            f"{sorted(gate.sufficient_rules)}|{sorted(gate.required_any_groups)}|"
-            f"{gate.corroborating}|{gate.blockers}|{gate.confidence_threshold}"
+            f"gate:{gate.family}|{gate.paths}|{gate.primary}|{gate.corroborating}|"
+            f"{gate.blockers}|{gate.blocker_reasons}|{gate.reason_no_path}|"
+            f"{gate.reason_corroborating_only}"
         )
     for blocker in BLOCKERS:
         parts.append(f"blocker:{blocker.name}|{_definition_signature(blocker.predicate)}")
     parts.append(f"decision_group_count:{DECISION_GROUP_COUNT}")
     parts.append(f"family_thresholds:{sorted(FAMILY_CONFIDENCE_THRESHOLDS.items())}")
+    parts.append(f"threshold_provenance:{sorted(FAMILY_THRESHOLD_PROVENANCE.items())}")
+    parts.append(f"threshold_holds:{sorted(FAMILY_THRESHOLD_HOLDS.items())}")
     parts.append(f"press_release_policy:{PRESS_RELEASE_POLICY}")
     parts.append(f"scored_families:{list(SCORED_FAMILIES)}")
     digest = hashlib.sha1("\n".join(parts).encode("utf-8")).hexdigest()
@@ -2068,9 +2325,10 @@ def _rule_fingerprint() -> str:
 #: rule, a weight, a gate, a blocker or a family threshold moves it.
 RULE_FINGERPRINT = _rule_fingerprint()
 
-#: v5: primary/corroborating separation, declarative family gates, per-family
-#: operating points.
-CLASSIFIER_VERSION = f"rules-rvl-cdip-v5+{RULE_FINGERPRINT}"
+#: v6: visual evidence collapsed into one group, gate acceptance paths with
+#: declared refusal reasons, ``headline_body`` and ``bullet_layout`` removed,
+#: ``marketing_copy`` added, development-set family thresholds.
+CLASSIFIER_VERSION = f"rules-rvl-cdip-v6+{RULE_FINGERPRINT}"
 
 
 def available_channels(features: dict) -> frozenset[str]:
@@ -2423,6 +2681,14 @@ def classify_with_rules(
                 for family, gate in gates.items()
                 if gate["status"] != "satisfied" and pre_gate_scores.get(family, 0.0) > 0.0
             ),
+            # The declared refusal reason per gated family, so error analysis
+            # can group refusals (visual_evidence_only,
+            # insufficient_presentation_text, ...) without re-deriving them.
+            "gate_reasons": {
+                family: gate["reason"]
+                for family, gate in sorted(gates.items())
+                if gate["status"] != "satisfied"
+            },
             # Fired rules for every family, not only the winner: error analysis
             # needs to see what the losing families had.
             "rules_by_family": {
@@ -2472,6 +2738,14 @@ def classify_with_rules(
             # in the output rather than hidden in the module.
             "family_confidence": family_thresholds,
             "declared_family_confidence": dict(FAMILY_CONFIDENCE_THRESHOLDS),
+            "family_threshold_provenance": dict(FAMILY_THRESHOLD_PROVENANCE),
+            "family_threshold_holds": dict(FAMILY_THRESHOLD_HOLDS),
+            # The bar this decision was actually judged against, reported
+            # separately from the global threshold: a family-specific bar that
+            # only appears as a global number is a lower bar nobody can see.
+            "effective_family_threshold": effective_family_threshold(
+                top_family, confidence_threshold, family_thresholds
+            ),
             "applied_confidence": decision["applied_confidence_threshold"],
             "minimum_score_margin": float(min_score_margin),
             "minimum_recognized_characters": int(min_recognized_characters),

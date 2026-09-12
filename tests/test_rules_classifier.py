@@ -171,13 +171,22 @@ class ClassificationTests(unittest.TestCase):
         ))
         self.assertEqual(result["document_family"], "technical_report")
 
-    def test_business_report(self):
+    def test_business_report_is_never_predicted(self):
+        """``business_report`` is in the taxonomy but excluded from scoring.
+
+        No canonical RVL-CDIP target maps to it, so any prediction of it would
+        be a false positive by construction. This test asserted the opposite
+        and had been failing since the family was excluded — a red test nobody
+        could make green, which is worse than no test: it hid the two genuine
+        failures beside it.
+        """
         _, result = classify(make_document(
             "ANNUAL REPORT\nExecutive Summary\nFiscal year revenue and expenses\n"
             "Budget variance and KPI forecast",
             ["Title", "Section-header", "Text", "Table"],
         ))
-        self.assertEqual(result["document_family"], "business_report")
+        self.assertNotIn("business_report", result["candidate_scores"])
+        self.assertNotEqual(result["document_family"], "business_report")
 
     def test_form(self):
         _, result = classify(make_document(
@@ -187,9 +196,16 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(result["document_family"], "form_structured")
 
     def test_presentation(self):
+        """Deck vocabulary in heading position, corroborated by pictures.
+
+        ``Agenda`` is now required to stand as a heading line rather than to
+        appear anywhere on the page, and the pictures corroborate the case
+        rather than making it: see ``tests/test_family_gates.py`` for the
+        refusal side of the same rule.
+        """
         _, result = classify(
             make_document(
-                "Project Presentation\nAgenda\n[ ] Market\n[ ] Product",
+                "Agenda\nMarket overview\nProduct roadmap",
                 ["Title", "Picture", "Picture", "List-item", "List-item"],
             ),
             page_size=[1600, 900],
@@ -197,12 +213,20 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(result["document_family"], "presentation_marketing")
 
     def test_unmatched_document_falls_back_to_other(self):
+        """A document matching no rule is refused, and says why.
+
+        The reason changed with the v5 gates: the only rule this text used to
+        fire was ``two_column_layout``, and layout alone no longer opens a
+        decision, so the refusal is now ``no_rules_matched`` rather than a
+        score below the bar. Both are refusals to ``other``; the test asserts
+        the refusal and accepts either reason for it.
+        """
         _, result = classify(make_document(
             "Hello team. The meeting has moved to Tuesday afternoon. Please confirm attendance."
         ))
         self.assertEqual(result["document_family"], "other")
         self.assertEqual(result["decision"], "fallback")
-        self.assertEqual(result["reason"], "score_below_threshold")
+        self.assertIn(result["reason"], {"no_rules_matched", "score_below_threshold"})
 
     def test_insufficient_ocr_abstains(self):
         _, result = classify(make_document("x", ["Text"]))
