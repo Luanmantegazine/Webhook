@@ -57,10 +57,16 @@ class TaxonomyConfigError(RuntimeError):
     """The shipped taxonomy config contradicts this module."""
 
 
-#: Bumped whenever the family set or the label mapping changes. Any stored
-#: result carrying a different value was produced against a different ground
-#: truth and must not be pooled with the current one.
-TAXONOMY_VERSION = "rvl-cdip-2.0"
+#: Bumped whenever the family set, the label mapping or the subtype vocabulary
+#: changes. Any stored result carrying a different value was produced against a
+#: different ground truth and must not be pooled with the current one.
+#:
+#: 2.1 adds document subtypes. No label was remapped and no family was added or
+#: removed — every RVL-CDIP class resolves exactly where it did under 2.0 — so
+#: the change is a refinement *within* a family, not a change of ground truth.
+#: It is versioned all the same: a consumer reading ``document_subtype`` needs
+#: to know whether the producer could emit one.
+TAXONOMY_VERSION = "rvl-cdip-2.1"
 
 #: Public family taxonomy. ``other`` is both the residual class and the
 #: destination of every abstention; ``business_report`` is retained for
@@ -92,6 +98,36 @@ NOT_EVALUATED_WITH_RVL_CDIP: tuple[str, ...] = ("legal_document", "manual_proced
 
 #: Corpus classes that are targets for *refusal*, not for classification.
 REJECTION_LABELS = frozenset({"handwritten", "file folder"})
+
+#: Subtypes reported inside a family, added in taxonomy 2.1.
+#:
+#: ``news_article`` is a legacy public key: it is the RVL-CDIP class name and
+#: the key every workflow reads, and it is kept unchanged. Conceptually the
+#: family is a *news publication*, and it covers two document shapes that a
+#: downstream consumer may well want to treat differently — a clipped article
+#: and a whole newspaper issue with many articles, photographs and
+#: advertisements. Subtypes report that distinction without splitting the key.
+FAMILY_SUBTYPES: dict[str, tuple[str, ...]] = {
+    "news_article": ("newspaper_issue", "single_news_article"),
+}
+
+#: The conceptual name of a family whose public key is historical.
+FAMILY_CONCEPTUAL_NAMES: dict[str, str] = {
+    "news_article": "news_publication",
+}
+
+DOCUMENT_SUBTYPES: frozenset[str] = frozenset(
+    subtype for subtypes in FAMILY_SUBTYPES.values() for subtype in subtypes
+)
+
+
+def is_known_subtype(family: Any, subtype: Any) -> bool:
+    """A subtype is valid only for the family that declares it."""
+    if subtype is None:
+        return True
+    normalised_family = _normalise_label(family).replace(" ", "_")
+    normalised_subtype = _normalise_label(subtype).replace(" ", "_")
+    return normalised_subtype in FAMILY_SUBTYPES.get(normalised_family, ())
 
 #: The configurable half of the mapping. See the module docstring.
 SCIENTIFIC_REPORT_FAMILY_CHOICES: tuple[str, ...] = ("technical_report", "research_paper")
@@ -274,6 +310,8 @@ def taxonomy_descriptor() -> dict[str, Any]:
         "scored_families": list(SCORED_FAMILIES),
         "unscored_families": sorted(UNSCORED_FAMILIES),
         "rejection_labels": sorted(REJECTION_LABELS),
+        "family_subtypes": {family: list(values) for family, values in FAMILY_SUBTYPES.items()},
+        "family_conceptual_names": dict(FAMILY_CONCEPTUAL_NAMES),
         "not_evaluated_with_rvl_cdip": list(NOT_EVALUATED_WITH_RVL_CDIP),
         "label_mapping": dict(CLASS_TO_FAMILY),
         "scientific_report_family": SCIENTIFIC_REPORT_FAMILY,

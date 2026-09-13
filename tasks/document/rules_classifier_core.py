@@ -86,7 +86,13 @@ SUPPORTED_FEATURE_SCHEMA_VERSIONS = frozenset({SCHEMA_VERSION})
 # invalidates stale cached features even when the emitted key set is unchanged.
 # 2.3: narrative_line_ratio, academic/editorial metadata counts, quote and
 # press-release markers, marketing lexicon, technical-strength counters.
-FEATURE_EXTRACTION_VERSION = "2.3"
+# 2.4: newspaper structure (masthead, issue metadata, running header, headline
+# and article-cluster counts, per-page narrative column counts), multilingual
+# reporting counters, and a redefined accounting_negative_count that no longer
+# reads a dialling code as a negative balance. The redefinition is why this is
+# a version bump and not an additive change: the same key now means something
+# different, so 2.3 and 2.4 records must not be pooled.
+FEATURE_EXTRACTION_VERSION = "2.4"
 
 #: Provisional operating point, and the single source of truth for it. The task
 #: wrapper and the offline evaluator import these instead of restating them:
@@ -188,7 +194,20 @@ _CORRESPONDENCE_LABELS = frozenset(
 _CHECKBOX_RE = re.compile(r"(?:\[\s?[xX]?\s?\]|☐|☑|□|■|\(\s?\))")
 _BLANK_FIELD_RE = re.compile(r"(?:_{3,}|\.{5,})")
 _NUMBER_RE = re.compile(r"(?<![\w.])-?\(?\d[\d,]*(?:\.\d+)?\)?(?![\w.])")
-_ACCOUNTING_NEGATIVE_RE = re.compile(r"\(\s*\$?\s*\d[\d,]*(?:\.\d+)?\s*\)")
+#: Any parenthesised number. On its own this is *not* an accounting negative:
+#: ``(011)`` and ``(11)`` are dialling codes, ``(3)`` is a footnote marker and
+#: ``(2026)`` is a year. :func:`_count_accounting_negatives` decides which of
+#: them are money.
+_PARENTHESISED_NUMBER_RE = re.compile(
+    r"\(\s*(?P<currency>R\$|US\$|\$|€|£)?\s*(?P<digits>\d[\d.,]*)\s*\)"
+)
+#: Retained for consumers that import it; the classifier uses the counter.
+_ACCOUNTING_NEGATIVE_RE = _PARENTHESISED_NUMBER_RE
+#: A telephone number: a two-to-four digit code in parentheses, followed by the
+#: rest of the number. Excluded before anything else is considered.
+_PHONE_PARENTHESES_RE = re.compile(
+    r"\(\s*0?\d{2,4}\s*\)\s*[\d][\d\s.\u2010-\u2015-]{5,}"
+)
 _MONTH_RE = re.compile(
     r"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
     r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|"
@@ -257,18 +276,84 @@ _YEAR_RANGE_RE = re.compile(
 )
 
 # Case is carried explicitly rather than by IGNORECASE: the capitalisation of
-# the two following names is the discriminating part of the pattern.
-_BYLINE_RE = re.compile(r"^\s*[Bb]y\s+[A-Z][a-zA-Z.'-]+\s+[A-Z][a-zA-Z.'-]+", re.MULTILINE)
+# the following names is the discriminating part of the pattern. v8 adds the
+# Portuguese forms — the v7 rule only recognised ``By First Last``, so a
+# Brazilian newspaper had no byline at all as far as the classifier was
+# concerned, which is a property of the pattern and not of the document.
+_BYLINE_RE = re.compile(
+    r"^[ \t]*(?:[Bb]y|[Pp]or)\s+"
+    # An optional role or title before the name: "Por Jornalista João Silva".
+    r"(?:[A-ZÀ-Ý][\wÀ-ÿ.'’-]+\s+){0,2}"
+    r"[A-ZÀ-Ý][\wÀ-ÿ.'’-]+\s+[A-ZÀ-Ý][\wÀ-ÿ.'’-]+"
+    r"|^[ \t]*[Dd](?:a|e)\s+[Rr]eda[cç][aã]o\b"
+    r"|^[ \t]*[Rr]eportagem\s+d[eo]\s+[A-ZÀ-Ý]"
+    r"|^[ \t]*[Tt]exto\s+d[eo]\s+[A-ZÀ-Ý]",
+    re.MULTILINE,
+)
 _WIRE_SERVICE_RE = re.compile(
     r"\b(?:associated press|reuters|united press international|\(ap\)|\(upi\)|"
     r"staff (?:writer|reporter)|special to the|wire services?)\b",
     re.IGNORECASE,
 )
+# ``SÃO PAULO, 24 de janeiro de 2026`` alongside ``WASHINGTON, Apr. 4``.
 _DATELINE_RE = re.compile(
-    r"(?m)^\s*[A-Z][A-Z .]{2,25},\s*[A-Z][a-z]{2,9}\.?\s+\d{1,2}\b"
+    r"^[ \t]*[A-ZÀ-Ý][A-ZÀ-Ý .\-]{2,25},\s*"
+    r"(?:[A-Za-zÀ-ÿ]{3,10}\.?\s+\d{1,2}\b|\d{1,2}\s+de\s+[a-zà-ÿ]{3,10}\b)",
+    re.MULTILINE,
 )
-_ATTRIBUTION_RE = re.compile(
-    r"\b(?:said|says|told reporters|according to|commented)\b", re.IGNORECASE
+#: Reporting verbs in both languages. Kept as one lexicon because the rule is
+#: about journalistic attribution, not about which language it is written in.
+_REPORTING_VERB_RE = re.compile(
+    r"\b(?:said|says|stated|told reporters|according to|commented|reported|added|"
+    r"afirmou|afirma|disse|declarou|destacou|informou|explicou|relatou|acrescentou|"
+    r"segundo|conforme|ressaltou|apontou|comentou)\b",
+    re.IGNORECASE,
+)
+#: Retained under its previous name: the ``attribution_count`` feature and every
+#: consumer of it keep working, now over the multilingual lexicon.
+_ATTRIBUTION_RE = _REPORTING_VERB_RE
+
+#: A quotation followed or preceded by a reporting verb within a short window.
+#: An attribution verb alone is ordinary narrative; a quotation alone is any
+#: quoted phrase; the two together are reported speech.
+_QUOTED_SPAN = r"[\u201c\u00ab\"][^\u201d\u00bb\"\n]{10,400}[\u201d\u00bb\"]"
+_QUOTE_ATTRIBUTION_RE = re.compile(
+    rf"{_QUOTED_SPAN}[^\n]{{0,80}}?{_REPORTING_VERB_RE.pattern}"
+    rf"|{_REPORTING_VERB_RE.pattern}[^\n]{{0,80}}?{_QUOTED_SPAN}",
+    re.IGNORECASE,
+)
+
+# ---- publication identity -------------------------------------------------
+#: ``Ano XXXI``, ``Edição 717``, ``Número 42``, ``Nº 42``, ``Vol. 12``, ``No. 8``.
+#: A price is deliberately absent: it is corroboration, never identity.
+_ISSUE_METADATA_RE = re.compile(
+    r"\b(?:ano\s+(?:[IVXLC]{1,7}|\d{1,4})"
+    r"|edi[cç][aã]o\s+n?[ºo°]?\s*\d{1,5}"
+    r"|n[ºo°]\s*\d{1,5}"
+    r"|n[uú]mero\s+\d{1,5}"
+    r"|year\s+(?:[IVXLC]{1,7}|\d{1,4})"
+    r"|(?:issue|edition)\s+n?o?\.?\s*\d{1,5}"
+    r"|vol(?:ume)?\.?\s*(?:[IVXLC]{1,7}|\d{1,4}))\b",
+    re.IGNORECASE,
+)
+_PUBLICATION_DATE_RE = re.compile(
+    r"\b\d{1,2}\s+de\s+(?:janeiro|fevereiro|mar[cç]o|abril|maio|junho|julho|agosto|"
+    r"setembro|outubro|novembro|dezembro)\s+de\s+(?:19|20)\d{2}\b"
+    r"|\b(?:january|february|march|april|may|june|july|august|september|october|"
+    r"november|december)\s+\d{1,2},?\s+(?:19|20)\d{2}\b"
+    r"|\b\d{1,2}/\d{1,2}/(?:19|20)\d{2}\b",
+    re.IGNORECASE,
+)
+_PUBLICATION_URL_RE = re.compile(
+    r"\b(?:https?://|www\.)[\w.-]+\.[a-z]{2,}(?:\.[a-z]{2})?\b"
+    r"|\b[\w-]{3,}\.(?:com|net|org|jor|info|news)(?:\.[a-z]{2})?\b",
+    re.IGNORECASE,
+)
+#: A cover price. Recognised so it can be *reported*, and so the financial
+#: rules can tell an edition price from a billed amount — never so that it can
+#: open a gate on its own.
+_COVER_PRICE_RE = re.compile(
+    r"(?:R\$|US\$|\$|€|£)\s?\d{1,3}(?:[.,]\d{2})?\b", re.IGNORECASE
 )
 # Straight and typographic quotation marks. A news body quotes sources; an
 # attribution verb without a quotation is a narrative verb like any other, and
@@ -668,6 +753,239 @@ def _looks_two_column(
     )
 
 
+# --------------------------------------------------------------------------
+# Newspaper page structure
+# --------------------------------------------------------------------------
+#
+# A newspaper issue is not a long article: it is a masthead, a grid of columns,
+# and several headlines each with a body under it, repeated over pages. None of
+# that is visible in a bag of words, and none of it is visible in
+# ``two_column_ratio`` either, which answers a yes/no question about two
+# columns and says nothing about the three, four or five a front page carries.
+
+#: Region classes that carry the running text of a column. Pictures, captions,
+#: tables and formulas are excluded from the column estimate: their placement
+#: follows the figure, not the text grid.
+NARRATIVE_COLUMN_CLASSES = frozenset({"Text", "List-item"})
+HEADLINE_CLASSES = frozenset({"Title", "Section-header"})
+
+
+def _cluster_positions(values: list[float], tolerance: float) -> list[list[float]]:
+    clusters: list[list[float]] = []
+    for value in sorted(values):
+        if clusters and value - clusters[-1][-1] <= tolerance:
+            clusters[-1].append(value)
+        else:
+            clusters.append([value])
+    return clusters
+
+
+def _estimate_narrative_columns(
+    regions: list[dict], page_width: float, page_height: float
+) -> int:
+    """Count narrative columns from where the body text starts on the page.
+
+    Columns are counted by clustering the *left edge* of the substantial
+    narrative regions. A newspaper grid holds those edges to within a few
+    pixels down the page, so the clusters are the columns, and counting them
+    represents two, three, four or five equally well —
+    which ``two_column_ratio`` cannot, being a yes/no test for one split.
+
+    A coverage mask over the page width was tried first and rejected: printed
+    gutters run under one percent of the page, so any binning coarse enough to
+    be stable merged adjacent columns into a single band.
+
+    Excluded before clustering: pictures, captions, tables and formulas, whose
+    placement follows the figure rather than the grid; regions spanning most of
+    the width, which are banner headlines crossing every column; the top and
+    bottom bands, where a running header sits alone; and short regions, which
+    are labels and folios rather than a column of prose.
+    """
+    if page_width <= 0 or page_height <= 0:
+        return 0
+    starts: list[float] = []
+    for region in regions:
+        if region.get("class_name") not in NARRATIVE_COLUMN_CLASSES:
+            continue
+        bbox = _valid_bbox(region.get("bbox"))
+        if bbox is None:
+            continue
+        width = bbox[2] - bbox[0]
+        if width >= 0.60 * page_width or width < 0.04 * page_width:
+            continue
+        centre_y = (bbox[1] + bbox[3]) / 2.0
+        if centre_y <= 0.06 * page_height or centre_y >= 0.96 * page_height:
+            continue
+        text = _normalise_text(region.get("text"))
+        tall_enough = (bbox[3] - bbox[1]) >= 0.03 * page_height
+        wordy_enough = len(_WORD_RE.findall(text)) >= 20
+        if not (tall_enough or wordy_enough):
+            continue
+        starts.append(bbox[0])
+
+    if len(starts) < 2:
+        return 0
+    tolerance = max(3.0, 0.02 * page_width)
+    return len(_cluster_positions(starts, tolerance))
+
+
+def _is_headline_region(region: dict, page_height: float) -> bool:
+    """A short, titled line that is not a sentence."""
+    if region.get("class_name") not in HEADLINE_CLASSES:
+        return False
+    text = _normalise_text(region.get("text"))
+    if not text or text.endswith((".", ";", ":")):
+        return False
+    words = _WORD_RE.findall(text)
+    if not 1 <= len(words) <= 14:
+        return False
+    bbox = _valid_bbox(region.get("bbox"))
+    if bbox is None or page_height <= 0:
+        return False
+    return (bbox[3] - bbox[1]) / page_height >= 0.008
+
+
+def _count_article_clusters(
+    regions: list[dict], page_width: float, page_height: float
+) -> int:
+    """Headlines that actually have an article under them.
+
+    A page of headings is a table of contents; a page of headlines each
+    followed by body text in the same column is a newspaper page. The
+    difference is the body, so it is what gets counted.
+    """
+    headlines = []
+    bodies = []
+    for region in regions:
+        bbox = _valid_bbox(region.get("bbox"))
+        if bbox is None:
+            continue
+        if _is_headline_region(region, page_height):
+            headlines.append(bbox)
+        elif region.get("class_name") in NARRATIVE_COLUMN_CLASSES and _normalise_text(
+            region.get("text")
+        ):
+            bodies.append(bbox)
+
+    clusters = 0
+    for headline in headlines:
+        headline_width = headline[2] - headline[0]
+        if headline_width <= 0:
+            continue
+        for body in bodies:
+            if body[1] < headline[3] - 0.01 * page_height:
+                continue  # not below the headline
+            if body[1] - headline[3] > 0.30 * page_height:
+                continue  # too far to belong to it
+            overlap = min(headline[2], body[2]) - max(headline[0], body[0])
+            if overlap >= 0.40 * min(headline_width, body[2] - body[0]):
+                clusters += 1
+                break
+    return clusters
+
+
+def _top_band_signature(regions: list[dict], page_height: float) -> str:
+    """Normalised text of the top band, used to spot a running header."""
+    if page_height <= 0:
+        return ""
+    parts = []
+    for region in regions:
+        bbox = _valid_bbox(region.get("bbox"))
+        if bbox is None or bbox[1] > 0.10 * page_height:
+            continue
+        text = _normalise_text(region.get("text"))
+        if text:
+            parts.append(text)
+    signature = _text_key(" ".join(parts))
+    # Long top bands are the lead article, not a running header.
+    return signature if 4 <= len(signature) <= 80 else ""
+
+
+def _detect_masthead(regions: list[dict], page_width: float, page_height: float) -> bool:
+    """A short, visually dominant title in the top band, with editorial metadata.
+
+    Every clause carries its weight: the title must be *short* (a nameplate, not
+    a headline), *dominant* (set far larger than body text), in the *top band*,
+    and accompanied by something that identifies the publication — a domain, an
+    issue number, a publication date. A cover price is not in that list: a price
+    beside a title is a magazine cover, a flyer, or a menu just as often.
+    """
+    if page_width <= 0 or page_height <= 0:
+        return False
+    top_band_text = []
+    candidate = False
+    for region in regions:
+        bbox = _valid_bbox(region.get("bbox"))
+        if bbox is None:
+            continue
+        if bbox[1] <= 0.35 * page_height:
+            text = _normalise_text(region.get("text"))
+            if text:
+                top_band_text.append(text)
+        if region.get("class_name") not in HEADLINE_CLASSES:
+            continue
+        if bbox[1] > 0.22 * page_height:
+            continue
+        text = _normalise_text(region.get("text"))
+        words = _WORD_RE.findall(text)
+        if not text or not 1 <= len(words) <= 6:
+            continue
+        if (bbox[2] - bbox[0]) < 0.35 * page_width:
+            continue
+        if (bbox[3] - bbox[1]) / page_height < 0.030:
+            continue
+        letters = [character for character in text if character.isalpha()]
+        if letters and sum(character.isupper() for character in letters) / len(letters) < 0.5:
+            if not text.istitle():
+                continue
+        candidate = True
+
+    if not candidate:
+        return False
+    banner = "\n".join(top_band_text)
+    return bool(
+        _ISSUE_METADATA_RE.search(banner)
+        or _PUBLICATION_DATE_RE.search(banner)
+        or _PUBLICATION_URL_RE.search(banner)
+    )
+
+
+def _count_accounting_negatives(text: str, table_text: str) -> int:
+    """Parenthesised numbers that are actually negative money.
+
+    Accounting notation writes a negative as ``(1,234.00)``. So does a
+    telephone directory, a footnote marker and a citation year, and counting
+    those gave a newspaper — full of ``(011)`` dialling codes — the strongest
+    financial signal in the corpus. A parenthesised number now counts only when
+    it carries a currency symbol, sits inside a table, or has accounting
+    vocabulary within a short window of it.
+    """
+    if not text:
+        return 0
+    phone_spans = [match.span() for match in _PHONE_PARENTHESES_RE.finditer(text)]
+    table_key = _text_key(table_text)
+    count = 0
+    for match in _PARENTHESISED_NUMBER_RE.finditer(text):
+        start, end = match.span()
+        if any(start >= span[0] and start < span[1] for span in phone_spans):
+            continue
+        digits = match.group("digits")
+        if match.group("currency"):
+            count += 1
+            continue
+        # A bare integer of two to four digits is far more often a code, a
+        # footnote or a year than a negative balance.
+        if "." not in digits and "," not in digits and len(digits) <= 4:
+            continue
+        if table_key and _text_key(match.group(0)) in table_key:
+            count += 1
+            continue
+        window = text[max(0, start - 80) : end + 80]
+        if _ACCOUNTING_TERM_RE.search(window) or _CURRENCY_RE.search(window):
+            count += 1
+    return count
+
+
 def _count_field_labels(text: str) -> tuple[int, int]:
     """Split ``Label:`` lines into form fields and correspondence headers.
 
@@ -739,6 +1057,15 @@ def extract_classification_features(
     page_area_total = 0.0
     region_confidences: list[float] = []
     suppressed_region_count = 0
+    # ---- newspaper structure, accumulated per page --------------------------
+    column_count_by_page: list[int] = []
+    multi_column_pages = 0
+    headline_count = 0
+    article_cluster_count = 0
+    masthead_pages = 0
+    newspaper_pages = 0
+    top_band_signatures: list[str] = []
+    table_text_parts: list[str] = []
 
     for page_index, page in enumerate(pages):
         regions = page.get("regions", []) if isinstance(page, dict) else []
@@ -757,6 +1084,23 @@ def extract_classification_features(
             page_orientations.append("landscape" if width > height else "portrait")
             if _looks_two_column(typed_regions, width, height):
                 two_column_pages += 1
+
+            columns = _estimate_narrative_columns(typed_regions, width, height)
+            column_count_by_page.append(columns)
+            if columns >= 2:
+                multi_column_pages += 1
+            page_headlines = sum(
+                1 for region in typed_regions if _is_headline_region(region, height)
+            )
+            headline_count += page_headlines
+            article_cluster_count += _count_article_clusters(typed_regions, width, height)
+            if _detect_masthead(typed_regions, width, height):
+                masthead_pages += 1
+            if columns >= 2 and page_headlines >= 1:
+                newspaper_pages += 1
+            signature = _top_band_signature(typed_regions, height)
+            if signature:
+                top_band_signatures.append(signature)
 
         for region in typed_regions:
             class_name = str(region.get("class_name") or "Unknown")
@@ -785,6 +1129,10 @@ def extract_classification_features(
                 region_text = _select_table_text(region.get("table_data"))
                 if not region_text:
                     region_text = _normalise_text(region.get("text"))
+                if region_text:
+                    # Kept separately so an accounting figure inside a table can
+                    # be told from a number in running prose.
+                    table_text_parts.append(region_text)
 
             if region_text:
                 # The de-duplicated stream feeds the lexical rules, where a
@@ -815,6 +1163,7 @@ def extract_classification_features(
 
     text = "\n".join(text_parts)[:text_limit]
     raw_text = "\n".join(raw_text_parts)[:text_limit]
+    table_text = "\n".join(table_text_parts)[:text_limit]
 
     words = _WORD_RE.findall(text)
     lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -839,6 +1188,14 @@ def extract_classification_features(
 
     accounting_term_count = len(_ACCOUNTING_TERM_RE.findall(text))
     currency_matches = len(_CURRENCY_RE.findall(text))
+
+    # A running header is the same short line at the top of several pages. One
+    # page cannot have one, so the ratio is only defined from two pages up.
+    repeated_header_ratio = 0.0
+    if len(top_band_signatures) >= 2:
+        most_common, occurrences = Counter(top_band_signatures).most_common(1)[0]
+        if most_common and occurrences >= 2:
+            repeated_header_ratio = occurrences / max(1, measured_pages or total_pages)
 
     extracted = {
         "schema_version": SCHEMA_VERSION,
@@ -899,7 +1256,7 @@ def extract_classification_features(
         # the lexicon behind it is now disjoint from the business lexicon.
         "financial_term_count": accounting_term_count,
         "business_term_count": len(_BUSINESS_TERM_RE.findall(text)),
-        "accounting_negative_count": len(_ACCOUNTING_NEGATIVE_RE.findall(text)),
+        "accounting_negative_count": _count_accounting_negatives(text, table_text),
         "table_area_ratio": area_ratio(table_area),
         "citation_match_count": len(_CITATION_RE.findall(text)),
         "doi_match_count": len(_DOI_RE.findall(text)),
@@ -921,6 +1278,26 @@ def extract_classification_features(
         "press_release_marker_count": len(_PRESS_RELEASE_RE.findall(text)),
         "marketing_term_count": len(_MARKETING_TERM_RE.findall(text)),
         "specification_strength_count": len(_SPEC_STRENGTH_RE.findall(text)),
+        # ---- news publication structure (v8) ----------------------------
+        # A newspaper issue is a masthead, a column grid and several headlines
+        # each with an article under it. None of that is observable in the
+        # word bag these features used to be, so each part is measured.
+        "publication_masthead_count": masthead_pages,
+        "issue_metadata_count": len(_ISSUE_METADATA_RE.findall(text)),
+        "publication_date_count": len(_PUBLICATION_DATE_RE.findall(text)),
+        "publication_url_count": len(_PUBLICATION_URL_RE.findall(text)),
+        "cover_price_count": len(_COVER_PRICE_RE.findall(text)),
+        "repeated_publication_header_ratio": round(repeated_header_ratio, 4),
+        "headline_count": headline_count,
+        "article_cluster_count": article_cluster_count,
+        "estimated_column_count_by_page": list(column_count_by_page),
+        "max_narrative_column_count": max(column_count_by_page) if column_count_by_page else 0,
+        "multi_column_page_ratio": (
+            round(multi_column_pages / measured_pages, 4) if measured_pages else 0.0
+        ),
+        "newspaper_page_count": newspaper_pages,
+        "reporting_verb_count": len(_REPORTING_VERB_RE.findall(text)),
+        "quotation_attribution_count": len(_QUOTE_ATTRIBUTION_RE.findall(text)),
     }
     extracted.update(
         extract_geometry_features(
@@ -1204,7 +1581,15 @@ RULES: tuple[RuleSpec, ...] = (
         lambda c: c.has(_SUBTOTAL_RE) and c.has(_TAX_RE) and c.has(_TOTAL_RE),
         group="totals_block",
     ),
-    _rule("financial_document", "currency_values", lambda c: c.num("currency_match_count") >= 2),
+    # v8: a count alone counted a newspaper's advertised prices and its cover
+    # price as financial evidence. A financial document is *dense* in money;
+    # a newspaper mentions a few prices across thousands of words.
+    _rule(
+        "financial_document",
+        "currency_values",
+        lambda c: c.num("currency_match_count") >= 2
+        and c.flt("currency_matches_per_1000_words") >= 1.5,
+    ),
     _rule("financial_document", "financial_statement_terms", lambda c: c.has(_STATEMENT_RE), group="statement_block"),
     _rule(
         "financial_document",
@@ -1214,7 +1599,19 @@ RULES: tuple[RuleSpec, ...] = (
     ),
     _rule("financial_document", "financial_units", lambda c: c.has(_FINANCIAL_UNITS_RE)),
     _rule("financial_document", "accounting_vocabulary", lambda c: c.num("accounting_term_count") >= 4),
-    _rule("financial_document", "monthly_series", lambda c: c.num("month_match_count") >= 3),
+    # v8: four month names in four different articles are not a monthly series.
+    # A series is a structure — a table, or months alongside the vocabulary of
+    # accounting — not a count of calendar words.
+    _rule(
+        "financial_document",
+        "monthly_series",
+        lambda c: c.num("month_match_count") >= 3
+        and (
+            c.flt("table_density") >= 0.05
+            or c.num("accounting_term_count") >= 2
+            or c.flt("currency_matches_per_1000_words") >= 1.5
+        ),
+    ),
     # The three former table rules collapsed into one: they tested the same
     # ``table_density`` observation and tripled its weight for this family.
     _rule(
@@ -1389,29 +1786,108 @@ RULES: tuple[RuleSpec, ...] = (
     _rule("resume", "education_section", lambda c: c.has(_EDUCATION_SECTION_RE)),
     _rule("resume", "year_ranges", lambda c: c.num("year_range_count") >= 3),
     _rule("resume", "cv_sections", lambda c: c.has(_RESUME_EXTRA_RE)),
-    # ---- news article ----------------------------------------------------
+    # ---- news publication (legacy key: news_article) ---------------------
+    # v8 widens the family from "a news article" to "a journalistic
+    # publication", which is what the corpus actually contains: whole
+    # newspapers, with a masthead, a column grid, many headlines, photographs
+    # and advertisements. The public key stays ``news_article`` — workflows and
+    # the RVL-CDIP mapping depend on it — and the two shapes are separated by
+    # ``document_subtype`` instead.
     _rule("news_article", "byline", lambda c: c.has(_BYLINE_RE)),
     _rule("news_article", "dateline", lambda c: c.has(_DATELINE_RE)),
     _rule("news_article", "wire_service", lambda c: c.has(_WIRE_SERVICE_RE)),
-    # Attribution verbs without quotations are ordinary narrative verbs; a
-    # reported speech block is an attribution verb *and* a quotation.
+    # Reported speech: an attribution verb *attached to* a quotation, or enough
+    # attribution in a body long enough for it to be narrative. One "disse" in
+    # a caption decides nothing.
     _rule(
         "news_article",
         "attribution_quotes",
-        lambda c: c.num("attribution_count") >= 3 and c.num("quote_mark_count") >= 2,
+        lambda c: c.num("quotation_attribution_count") >= 2
+        or (
+            c.num("quotation_attribution_count") >= 1
+            and c.num("reporting_verb_count") >= 3
+        ),
+        group="reporting_evidence",
     ),
     _rule(
         "news_article",
-        "multi_column_body",
-        lambda c: c.flt("two_column_ratio") >= 0.5 and c.num("word_count") >= 200,
-        group="news_layout",
-        requires="layout",
+        "multilingual_reporting",
+        lambda c: c.num("reporting_verb_count") >= 4 and c.num("word_count") >= 250,
+        group="reporting_evidence",
     ),
     _rule(
         "news_article",
         "justified_body",
         _typeset_body,
-        group="news_layout",
+        group="reporting_evidence",
+        requires="geometry",
+    ),
+    # ---- publication identity -------------------------------------------
+    _rule(
+        "news_article",
+        "publication_masthead",
+        lambda c: c.num("publication_masthead_count") >= 1,
+        group="publication_identity",
+        requires="layout",
+    ),
+    # A running header across pages identifies a publication without any
+    # nameplate detection at all, which is what saves a scan whose first page
+    # is missing or whose masthead did not survive OCR.
+    _rule(
+        "news_article",
+        "repeated_publication_header",
+        lambda c: c.flt("repeated_publication_header_ratio") >= 0.50
+        and c.num("total_pages") >= 3,
+        group="publication_identity",
+        requires="layout",
+    ),
+    _rule(
+        "news_article",
+        "issue_metadata",
+        lambda c: c.num("issue_metadata_count") >= 1
+        and (c.num("publication_date_count") >= 1 or c.num("issue_metadata_count") >= 2),
+        group="issue_metadata",
+    ),
+    # ---- editorial structure ---------------------------------------------
+    _rule(
+        "news_article",
+        "multiple_headlines",
+        lambda c: c.num("headline_count") >= 4,
+        group="editorial_structure",
+        requires="layout",
+    ),
+    _rule(
+        "news_article",
+        "multiple_article_clusters",
+        lambda c: c.num("article_cluster_count") >= 3,
+        group="editorial_structure",
+        requires="layout",
+    ),
+    # ---- newspaper layout -------------------------------------------------
+    _rule(
+        "news_article",
+        "multi_column_body",
+        lambda c: c.flt("two_column_ratio") >= 0.5 and c.num("word_count") >= 200,
+        group="newspaper_layout",
+        requires="layout",
+    ),
+    # Two, three, four or more narrative columns, on most of the pages. This is
+    # the rule ``two_column_ratio`` could not be: a five-column front page is
+    # not "two columns", and reading it as a failure of the two-column test is
+    # how a newspaper came to have no layout evidence at all.
+    _rule(
+        "news_article",
+        "multi_column_publication",
+        lambda c: c.flt("multi_column_page_ratio") >= 0.50
+        and c.num("max_narrative_column_count") >= 2,
+        group="newspaper_layout",
+        requires="layout",
+    ),
+    _rule(
+        "news_article",
+        "newspaper_column_geometry",
+        lambda c: c.flt("newspaper_column_geometry_ratio") >= 0.50,
+        group="newspaper_layout",
         requires="geometry",
     ),
     # ``headline_body`` was removed in v6. It fired six times on the
@@ -1502,12 +1978,24 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     "resume.education_section": 0.22,
     "resume.year_ranges": 0.16,
     "resume.cv_sections": 0.12,
+    # v8. Every new group is capped at 0.20 so the family's decision mass —
+    # the three strongest group capacities — stays at 0.68, exactly where v7
+    # left it. Otherwise widening the family would have quietly raised the bar
+    # for the single-article path that was already validated.
     "news_article.byline": 0.26,
     "news_article.dateline": 0.22,
     "news_article.wire_service": 0.20,
     "news_article.attribution_quotes": 0.16,
-    "news_article.multi_column_body": 0.16,
+    "news_article.multilingual_reporting": 0.14,
     "news_article.justified_body": 0.16,
+    "news_article.publication_masthead": 0.20,
+    "news_article.repeated_publication_header": 0.18,
+    "news_article.issue_metadata": 0.18,
+    "news_article.multiple_headlines": 0.16,
+    "news_article.multiple_article_clusters": 0.18,
+    "news_article.multi_column_body": 0.16,
+    "news_article.multi_column_publication": 0.20,
+    "news_article.newspaper_column_geometry": 0.18,
 }
 
 
@@ -1761,6 +2249,15 @@ class FamilyGate(NamedTuple):
         has to reconstruct.
     ``reason_no_path``
         Refusal reason when nothing fired at all.
+    ``path_subtypes``
+        Optional ``(path name, subtype)`` pairs. A family whose shapes differ
+        enough to matter downstream — a whole newspaper issue against a single
+        clipped article — reports which one it matched as ``document_subtype``,
+        without splitting the public family key that workflows and the RVL-CDIP
+        mapping depend on.
+    ``metric_keys``
+        Feature keys reported beside the gate, so the numbers a reader would
+        need to check the decision are in the same record as the decision.
 
     Family thresholds are *not* declared here: they live in
     :data:`FAMILY_CONFIDENCE_THRESHOLDS` with their provenance, because a
@@ -1776,6 +2273,8 @@ class FamilyGate(NamedTuple):
     reason_no_path: str
     reason_corroborating_only: str
     rationale: str
+    path_subtypes: tuple[tuple[str, str], ...] = ()
+    metric_keys: tuple[str, ...] = ()
 
 
 #: The structural signals a form may be corroborated by. Named once: the gate
@@ -1934,28 +2433,91 @@ FAMILY_GATES: tuple[FamilyGate, ...] = (
     ),
     FamilyGate(
         family="news_article",
-        # v6. The development set offered exactly one safe combination —
-        # byline with reported speech or a justified body — which found three
-        # news articles and no negatives. ``byline + multi_column_body`` and
-        # ``wire_service + attribution_quotes`` are explicitly *not* paths:
-        # both admitted advertisements and scientific publications, because a
-        # column count is a typesetting fact and an attribution verb is a
-        # narrative one. Neither pair can satisfy any path below without a
-        # third, independent signal.
+        # v8: two independent shapes under one public key.
+        #
+        # The single-article paths are v7's, unchanged and still the only ones
+        # validated on the development set. The newspaper-issue paths are new:
+        # a whole newspaper has no byline of its own and no single dateline, so
+        # under v7 it had no way to be recognised at all — the family was
+        # defined as "an article", and an issue is a container of articles.
+        #
+        # An issue must show all three of identity, editorial structure and
+        # layout. Photographs, a price, short text or columns alone open
+        # nothing: a magazine, a catalogue and a form all have columns, and a
+        # price beside a title is a cover of some kind but not necessarily a
+        # newspaper.
         paths=(
             GatePath(
                 name="byline_with_reporting",
                 all_of=("byline",),
-                any_of=(("attribution_quotes", "justified_body"),),
+                any_of=(("attribution_quotes", "justified_body", "multilingual_reporting"),),
             ),
             GatePath(
                 name="wire_and_dateline_with_reporting",
                 all_of=("wire_service", "dateline"),
-                any_of=(("attribution_quotes", "justified_body"),),
+                any_of=(("attribution_quotes", "justified_body", "multilingual_reporting"),),
+            ),
+            GatePath(
+                name="newspaper_issue_masthead",
+                all_of=(
+                    "publication_masthead",
+                    "issue_metadata",
+                    "multiple_headlines",
+                    "multiple_article_clusters",
+                ),
+                any_of=(
+                    (
+                        "multi_column_publication",
+                        "newspaper_column_geometry",
+                        "multi_column_body",
+                    ),
+                    # Reporting language, required in addition to identity,
+                    # structure and layout. A product catalogue satisfies all
+                    # three of those — a nameplate, an edition line, headings
+                    # over blurbs, a column grid — and is not journalism. What
+                    # separates a newspaper from any other multi-column
+                    # periodical is that it *reports*: quoted sources and
+                    # attribution verbs. ``justified_body`` is deliberately not
+                    # in this pool: justified type is a printing choice, not
+                    # evidence of reporting.
+                    ("attribution_quotes", "multilingual_reporting"),
+                ),
+            ),
+            GatePath(
+                name="newspaper_issue_running_header",
+                all_of=(
+                    "repeated_publication_header",
+                    "multiple_headlines",
+                    "multiple_article_clusters",
+                ),
+                any_of=(
+                    (
+                        "multi_column_publication",
+                        "newspaper_column_geometry",
+                        "multi_column_body",
+                    ),
+                    ("attribution_quotes", "multilingual_reporting"),
+                ),
             ),
         ),
-        primary=("byline", "wire_service", "dateline"),
-        corroborating=("attribution_quotes", "multi_column_body", "justified_body"),
+        primary=(
+            "byline",
+            "wire_service",
+            "dateline",
+            "publication_masthead",
+            "repeated_publication_header",
+            "issue_metadata",
+            "multiple_headlines",
+            "multiple_article_clusters",
+        ),
+        corroborating=(
+            "attribution_quotes",
+            "multilingual_reporting",
+            "justified_body",
+            "multi_column_body",
+            "multi_column_publication",
+            "newspaper_column_geometry",
+        ),
         blockers=(
             "research_publication_evidence",
             "advertisement_evidence",
@@ -1967,11 +2529,38 @@ FAMILY_GATES: tuple[FamilyGate, ...] = (
         reason_no_path="missing_independent_news_evidence",
         reason_corroborating_only="news_layout_or_attribution_only",
         rationale=(
-            "Only byline-with-reporting is validated on the development set. The "
-            "wire-and-dateline path demands three independent journalistic signals and "
-            "is **not** validated — it exists so a wire story without a byline is not "
-            "structurally unreachable, and it is the first thing to remove if news "
-            "precision regresses."
+            "Two shapes, one public key. A single article needs a byline with "
+            "reporting, or a wire service with a dateline and reporting — the v7 "
+            "paths, and still the only ones validated. A newspaper issue needs all "
+            "three of publication identity (a masthead with issue metadata, or a "
+            "running header across pages), editorial structure (several headlines, "
+            "each with an article under it) and a newspaper column grid. Neither "
+            "``byline + multi_column_body`` nor ``wire_service + "
+            "attribution_quotes`` satisfies any path. Both newspaper paths "
+            "additionally require reporting language: identity, structure and layout "
+            "alone are satisfied by a product catalogue, and what makes a publication "
+            "journalistic is that it reports."
+        ),
+        path_subtypes=(
+            ("byline_with_reporting", "single_news_article"),
+            ("wire_and_dateline_with_reporting", "single_news_article"),
+            ("newspaper_issue_masthead", "newspaper_issue"),
+            ("newspaper_issue_running_header", "newspaper_issue"),
+        ),
+        metric_keys=(
+            "publication_masthead_count",
+            "issue_metadata_count",
+            "publication_date_count",
+            "repeated_publication_header_ratio",
+            "headline_count",
+            "article_cluster_count",
+            "estimated_column_count_by_page",
+            "max_narrative_column_count",
+            "multi_column_page_ratio",
+            "newspaper_column_geometry_ratio",
+            "newspaper_page_count",
+            "reporting_verb_count",
+            "quotation_attribution_count",
         ),
     ),
     FamilyGate(
@@ -2224,12 +2813,15 @@ def evaluate_family_gates(
                 continue
 
         blocker_reasons = dict(gate.blocker_reasons)
+        subtypes = dict(gate.path_subtypes)
+        document_subtype = None
         if blocked_by:
             status = "blocked"
             reason = blocker_reasons.get(blocked_by[0], f"blocked_by_{blocked_by[0]}")
         elif satisfied_paths:
             status = "satisfied"
             reason = f"path_{satisfied_paths[0]}"
+            document_subtype = subtypes.get(satisfied_paths[0])
         elif corroborating_fired and not primary_fired and gate.reason_corroborating_only:
             # The v5 failure mode, named: evidence of the right shape but of
             # only one kind, which is a refusal and not a low score.
@@ -2242,11 +2834,22 @@ def evaluate_family_gates(
         report[gate.family] = {
             "status": status,
             "reason": reason,
+            # ``None`` for every family that declares no subtypes, so the field
+            # is present and readable everywhere rather than appearing only
+            # where it happens to apply.
+            "document_subtype": document_subtype,
+            "available_subtypes": sorted({value for _path, value in gate.path_subtypes}),
             "satisfied_paths": satisfied_paths,
+            "satisfied_requirements": sorted(fired),
             "unsatisfied_paths": unsatisfied_paths,
+            "missing_requirements": sorted(
+                {requirement for unmet in unsatisfied_paths.values() for requirement in unmet}
+            ),
             "primary_fired": primary_fired,
             "corroborating_fired": corroborating_fired,
             "blocked_by": blocked_by,
+            # The numbers behind the decision, in the record with the decision.
+            "metrics": {key: features.get(key) for key in gate.metric_keys},
             "available_channels": sorted(channels),
             "declared_family_threshold": FAMILY_CONFIDENCE_THRESHOLDS.get(gate.family),
             "threshold_provenance": FAMILY_THRESHOLD_PROVENANCE.get(
@@ -2383,11 +2986,13 @@ def _rule_fingerprint() -> str:
 #: rule, a weight, a gate, a blocker or a family threshold moves it.
 RULE_FINGERPRINT = _rule_fingerprint()
 
-#: v7: ``slide_structure`` joins the substitutable visual group, the
-#: presentation gate requires deck vocabulary, ``marketing_copy`` no longer
-#: opens a path, correspondence moves to 0.42, and the global operating point
-#: enters the fingerprint.
-CLASSIFIER_VERSION = f"rules-rvl-cdip-v7+{RULE_FINGERPRINT}"
+#: v8: ``news_article`` becomes a news *publication* family with two shapes —
+#: a whole newspaper issue and a single article — reported through
+#: ``document_subtype``; multilingual byline, dateline and reporting lexicons;
+#: newspaper structure and column features; and financial guards that stop a
+#: dialling code, a run of month names or a page of advertised prices from
+#: reading as accounting evidence.
+CLASSIFIER_VERSION = f"rules-rvl-cdip-v8+{RULE_FINGERPRINT}"
 
 
 def available_channels(features: dict) -> frozenset[str]:
@@ -2692,6 +3297,14 @@ def classify_with_rules(
     top_family, top_score = ranked[0]
     runner_up_family, runner_up_score = ranked[1]
     selected = decision["document_family"]
+    # Optional and additive: ``None`` whenever the selected family declares no
+    # subtypes or was not accepted, so no existing consumer has to change.
+    selected_gate = gates.get(selected) or {}
+    document_subtype = (
+        selected_gate.get("document_subtype")
+        if decision["decision"] in {"classified", "observed"}
+        else None
+    )
 
     candidate_scores = {family: entry["score"] for family, entry in sorted(breakdown.items())}
     candidate_scores["other"] = 0.0
@@ -2709,6 +3322,10 @@ def classify_with_rules(
         "mode": mode,
         "provenance": features.get("provenance") or {},
         "document_family": selected,
+        # ``news_article`` covers both a clipped article and a whole newspaper
+        # issue. The public family key is unchanged — workflows and the
+        # RVL-CDIP mapping depend on it — and the distinction is reported here.
+        "document_subtype": document_subtype,
         # ``confidence`` is the reporting value, clipped to [0, 1] for
         # downstream consumers; ``score`` is the unclipped evidence ratio the
         # thresholds are actually applied to. They are not probabilities.
