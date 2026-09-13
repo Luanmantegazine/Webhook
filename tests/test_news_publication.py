@@ -203,6 +203,210 @@ class SingleArticleTests(unittest.TestCase):
         self.assertEqual(result["document_subtype"], "single_news_article")
 
 
+class CompositeDocumentTests(unittest.TestCase):
+    """A newspaper contains other kinds of document without becoming them.
+
+    The family's guards were written for a single article — advertising copy, a
+    salutation, a form field, a reference list each say "not journalism" about
+    one document with one subject. An issue is a container: the advertisements
+    pay for it, the letters page is correspondence, the coupon is a form, the
+    book review carries citations. Evaluated over the whole document they read
+    its contents as proof that the container is something else.
+    """
+
+    def issue_containing(self, *extra_regions, pages=4):
+        """A structurally valid issue with extra material dropped into page 2."""
+        document = newspaper_issue(pages=pages)
+        document["pages"][1]["regions"].extend(extra_regions)
+        return document
+
+    def assert_still_a_newspaper(self, document, pages=4, blocked_guard=None):
+        _features, result = classify(document, pages=pages)
+        gate = news_gate(result)
+        self.assertEqual(result["document_family"], "news_article", gate)
+        self.assertEqual(result["document_subtype"], "newspaper_issue")
+        self.assertEqual(result["decision"], "classified")
+        if blocked_guard is not None:
+            # Without this the test could pass because the inserted content
+            # triggered nothing at all, which would prove nothing.
+            self.assertIn(
+                blocked_guard,
+                gate["path_evaluations"]["byline_with_reporting"]["blocked_by"],
+                f"{blocked_guard} did not fire; the fixture proves nothing",
+            )
+            self.assertEqual(
+                gate["path_evaluations"]["newspaper_issue_masthead"]["blocked_by"], []
+            )
+        return result
+
+    def test_an_advertisement_inside_an_issue_does_not_block_it(self):
+        """The regression this change exists for."""
+        result = self.assert_still_a_newspaper(
+            self.issue_containing(
+                region(
+                    "SPECIAL OFFER - limited time only. Order now and get a "
+                    "money-back guarantee on your first purchase.",
+                    "Text",
+                    [860, 1450, 1160, 1650],
+                )
+            )
+        )
+        gate = news_gate(result)
+        # The advertisement did veto the single-article reading, and that is
+        # the point: the guard still applies where it was written to apply.
+        self.assertIn(
+            "advertisement_evidence",
+            gate["path_evaluations"]["byline_with_reporting"]["blocked_by"],
+        )
+        self.assertEqual(
+            gate["path_evaluations"]["newspaper_issue_masthead"]["blocked_by"], []
+        )
+
+    def test_a_letters_page_does_not_block_the_issue(self):
+        self.assert_still_a_newspaper(
+            self.issue_containing(
+                region(
+                    "Dear Editor,\nI write to object to the proposed timetable "
+                    "for the works in the central district.\nSincerely yours,\nA reader",
+                    "Text",
+                    [860, 1450, 1160, 1650],
+                )
+            ),
+            blocked_guard="correspondence_evidence",
+        )
+
+    def test_a_coupon_does_not_block_the_issue(self):
+        # "Registration form" rather than "subscription form": the point of the
+        # test is that ``form_evidence`` *fires* and is not applied to the
+        # publication, so the heading has to be one the form lexicon knows.
+        self.assert_still_a_newspaper(
+            self.issue_containing(
+                region("REGISTRATION FORM", "Section-header", [80, 1450, 460, 1500]),
+                region(
+                    "Name: ______\nAddress: ______\nCity: ______\n[ ] One year  [ ] Two years",
+                    "Text",
+                    [80, 1510, 460, 1650],
+                ),
+            ),
+            blocked_guard="form_evidence",
+        )
+
+    def test_a_book_review_with_citations_does_not_block_the_issue(self):
+        self.assert_still_a_newspaper(
+            self.issue_containing(
+                region(
+                    "Abstract: the author revisits the archive. References [1] [2] "
+                    "are discussed at length, and the conclusions follow the method "
+                    "set out by the researchers. doi.org/10.1000/example",
+                    "Text",
+                    [470, 1450, 850, 1650],
+                )
+            ),
+            blocked_guard="research_publication_evidence",
+        )
+
+    def test_all_four_together_still_do_not_block_the_issue(self):
+        self.assert_still_a_newspaper(
+            self.issue_containing(
+                region(
+                    "SPECIAL OFFER - limited time. Order now, money-back guarantee.",
+                    "Text",
+                    [860, 1450, 1160, 1560],
+                ),
+                region(
+                    "Dear Editor,\nI object to the timetable.\nSincerely yours,\nA reader",
+                    "Text",
+                    [860, 1570, 1160, 1650],
+                ),
+                region("REGISTRATION FORM", "Section-header", [80, 1450, 460, 1500]),
+                region(
+                    "Name: ______\nAddress: ______\n[ ] One year  [ ] Two years",
+                    "Text",
+                    [80, 1510, 460, 1650],
+                ),
+                region(
+                    "Abstract: References [1] [2] and doi.org/10.1000/example",
+                    "Text",
+                    [470, 1450, 850, 1650],
+                ),
+            )
+        )
+
+    def test_a_press_release_inside_an_issue_does_not_block_it(self):
+        """Reprinting one is not being one."""
+        self.assert_still_a_newspaper(
+            self.issue_containing(
+                region(
+                    "FOR IMMEDIATE RELEASE - the company announced its results "
+                    "for the quarter ending in March.",
+                    "Text",
+                    [860, 1450, 1160, 1650],
+                )
+            ),
+            blocked_guard="press_release_evidence",
+        )
+
+    def test_a_press_release_on_its_own_is_still_not_an_article(self):
+        """The guard is preserved exactly where it was written to apply."""
+        document = single_article("en")
+        document["pages"][0]["regions"].insert(
+            0, region("FOR IMMEDIATE RELEASE", "Title", [80, 20, 600, 55])
+        )
+        _features, result = classify(document)
+        gate = news_gate(result)
+        self.assertNotEqual(result["document_family"], "news_article")
+        self.assertEqual(gate["status"], "blocked")
+        self.assertIn(
+            "press_release_evidence",
+            gate["path_evaluations"]["byline_with_reporting"]["blocked_by"],
+        )
+
+    def test_an_advertising_circular_is_still_not_a_newspaper(self):
+        """Dominance, not presence: the guard that survives on the issue paths."""
+        pages = []
+        for number in range(1, 3):
+            regions = [
+                region("WEEKLY DEALS", "Title", [80, 40, 1160, 190]),
+                region(
+                    "Issue 42  January 24, 2026  www.deals.example.com",
+                    "Text",
+                    [80, 200, 1160, 240],
+                ),
+            ]
+            top = 300
+            for index, (left, right) in enumerate(COLUMNS):
+                regions.append(
+                    region(f"Deal of the day {index}", "Section-header", [left, top, right, top + 60])
+                )
+                regions.append(
+                    region(
+                        "SPECIAL OFFER, limited time. Order now! Free trial and a "
+                        "money-back guarantee. Buy one, discount applies. Sale ends "
+                        "soon, satisfaction guaranteed, call today.",
+                        "Text",
+                        [left, top + 70, right, top + 900],
+                    )
+                )
+            pages.append({"page_number": number, "regions": regions})
+        document = {"total_pages": 2, "pages": pages, "full_text": ""}
+        _features, result = classify(document, pages=2)
+        self.assertNotEqual(result["document_family"], "news_article")
+
+    def test_the_gate_records_which_blockers_each_path_evaluated(self):
+        _features, result = classify(newspaper_issue())
+        gate = news_gate(result)
+        single = gate["path_evaluations"]["byline_with_reporting"]
+        issue = gate["path_evaluations"]["newspaper_issue_masthead"]
+        self.assertTrue(single["blockers_inherited_from_family"])
+        self.assertIn("press_release_evidence", single["blockers_evaluated"])
+        self.assertFalse(issue["blockers_inherited_from_family"])
+        self.assertEqual(
+            issue["blockers_evaluated"], ["predominantly_advertising_evidence"]
+        )
+        self.assertIn("blockers_evaluated", gate)
+        self.assertEqual(issue["subtype"], "newspaper_issue")
+
+
 class NewspaperFalsePositiveTests(unittest.TestCase):
     """Everything that has columns and headings but is not journalism."""
 
