@@ -380,6 +380,72 @@ class FinancialGuardTests(unittest.TestCase):
         self.assertFalse(result["rule_indicators"]["financial_document.monthly_series"])
 
 
+class ScannedNewsprintConventionTests(unittest.TestCase):
+    """Conventions a real scanned front page uses that v8 first did not read.
+
+    Each of these was found by running the classifier over an actual newspaper
+    page rather than over a fixture, and each is a general newspaper or scanning
+    convention — not a property of the page that exposed it.
+    """
+
+    def test_bylines_are_set_in_capitals(self):
+        """``BY JONATHAN MARTIN`` is the ordinary newspaper setting."""
+        from tasks.document.rules_classifier_core import _BYLINE_RE
+
+        for line in (
+            "BY JONATHAN MARTIN",
+            "BY JIM RUTENBERG AND NICK CORASANITI",
+            "POR JOÃO SILVA",
+            "By Jane Roberts",
+            "Por João Silva",
+        ):
+            with self.subTest(line=line):
+                self.assertTrue(_BYLINE_RE.search(line), line)
+
+    def test_a_lowercase_by_in_prose_is_not_a_byline(self):
+        from tasks.document.rules_classifier_core import _BYLINE_RE
+
+        self.assertIsNone(
+            _BYLINE_RE.search("by fostering confusion and distrust among voters")
+        )
+
+    def test_issue_numbers_carry_a_thousands_separator(self):
+        """A daily passes ten thousand issues and keeps printing the number."""
+        from tasks.document.rules_classifier_core import _ISSUE_METADATA_RE
+
+        for line in ("Issue Number No. 42,812", "No. 42,812", "Nº 42", "Edição 717"):
+            with self.subTest(line=line):
+                self.assertTrue(_ISSUE_METADATA_RE.search(line), line)
+        self.assertIsNone(_ISSUE_METADATA_RE.search("see page 42 for more"))
+
+    def test_ocr_of_newsprint_drops_inter_word_spaces(self):
+        """``NOVEMBER6,2020`` is a correct date read by an imperfect scanner."""
+        from tasks.document.rules_classifier_core import _PUBLICATION_DATE_RE
+
+        for line in (
+            "INTERNATIONALEDITION |FRIDAY,NOVEMBER6,2020",
+            "FRIDAY, NOVEMBER 6, 2020",
+            "24 de janeiro de 2026",
+        ):
+            with self.subTest(line=line):
+                self.assertTrue(_PUBLICATION_DATE_RE.search(line), line)
+        self.assertIsNone(_PUBLICATION_DATE_RE.search("November 2020 was the month"))
+
+    def test_a_masthead_needs_more_than_a_dominant_title(self):
+        """The nameplate alone is a cover; the metadata beside it is the identity."""
+        from tasks.document.rules_classifier_core import _detect_masthead
+
+        nameplate = region("THE REGIONAL DAILY", "Title", [80, 60, 1100, 230])
+        self.assertFalse(_detect_masthead([nameplate], 1240, 1750))
+        with_price_only = [nameplate, region("$1.00", "Text", [80, 250, 300, 290])]
+        self.assertFalse(_detect_masthead(with_price_only, 1240, 1750))
+        with_identity = [
+            nameplate,
+            region("Issue Number No. 42,812", "Text", [80, 250, 700, 290]),
+        ]
+        self.assertTrue(_detect_masthead(with_identity, 1240, 1750))
+
+
 class SubtypeTaxonomyTests(unittest.TestCase):
     def test_subtypes_are_declared_for_the_legacy_key(self):
         self.assertEqual(

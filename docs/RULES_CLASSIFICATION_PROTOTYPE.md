@@ -329,6 +329,60 @@ holds the catalogue as a regression case.
 
 Photographs, prices, short text and columns open nothing on their own.
 
+### Verified against a real newspaper page
+
+The family was checked on an actual scanned broadsheet front page (a daily's
+international edition, one page, 4112 × 6566 at 300 dpi) rather than only on
+fixtures. Result:
+
+```json
+{
+  "document_family": "news_article",
+  "document_subtype": "newspaper_issue",
+  "decision": "classified",
+  "score": 1.3235,
+  "reason": "path_newspaper_issue_masthead"
+}
+```
+
+with the gate metrics:
+
+| Metric | Value |
+| --- | --- |
+| `publication_masthead_count` | 1 |
+| `issue_metadata_count` | 1 |
+| `publication_date_count` | 1 |
+| `headline_count` | 29 |
+| `article_cluster_count` | 25 |
+| `estimated_column_count_by_page` | `[6]` |
+| `multi_column_page_ratio` | 1.0 |
+| `reporting_verb_count` | 6 |
+
+**What this does and does not establish.** The repository's OCR and layout stages
+(docTR, YOLO DocLayNet) are not installable in the development sandbox, so the
+`document`, `page_sizes` and `page_words` inputs were reconstructed offline with
+a stand-in OCR and a size-based region typer. The *rules* are therefore
+verified against a real newspaper's structure and wording; the pipeline
+end-to-end is not. Two numbers in the table are visibly limited by the stand-in
+rather than by the classifier — `quotation_attribution_count` is 0 and only
+about a quarter of the page's words were recovered — and the decision holds
+anyway, which is the useful part: the newspaper path does not depend on a
+complete transcription.
+
+Three pattern gaps were found by that run, each a general convention rather
+than a property of the page:
+
+| Gap | Fix |
+| --- | --- |
+| `BY JONATHAN MARTIN` — bylines are set in **capitals** | The case of the introducer is no longer discriminating; the case of the name after it still is. |
+| `Issue Number No. 42,812` — issue numbers carry a **thousands separator** | `No. 42,812` and `Edição 1.717` parse. `see page 42` still does not. |
+| `NOVEMBER6,2020` — OCR of newsprint drops **inter-word spaces** | The date pattern tolerates missing spaces between month, day and year. `November 2020 was` is still not a publication date. |
+
+The byline rule did **not** fire on that page: the byline lines did not survive
+reconstruction cleanly. The issue was recognised anyway, through publication
+identity, editorial structure, layout and reporting language — which is the
+reason the newspaper path exists separately from the single-article paths.
+
 ### Financial guards in v8
 
 A newspaper is full of numbers that are not accounting, and three of them were

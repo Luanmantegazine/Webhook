@@ -281,7 +281,10 @@ _YEAR_RANGE_RE = re.compile(
 # Brazilian newspaper had no byline at all as far as the classifier was
 # concerned, which is a property of the pattern and not of the document.
 _BYLINE_RE = re.compile(
-    r"^[ \t]*(?:[Bb]y|[Pp]or)\s+"
+    # ``BY``/``POR`` in full capitals is the ordinary newspaper setting for a
+    # byline, so the case of the introducer is not discriminating; the case of
+    # the *name* after it still is.
+    r"^[ \t]*(?:[Bb][Yy]|[Pp][Oo][Rr])\s+"
     # An optional role or title before the name: "Por Jornalista João Silva".
     r"(?:[A-ZÀ-Ý][\wÀ-ÿ.'’-]+\s+){0,2}"
     r"[A-ZÀ-Ý][\wÀ-ÿ.'’-]+\s+[A-ZÀ-Ý][\wÀ-ÿ.'’-]+"
@@ -327,20 +330,27 @@ _QUOTE_ATTRIBUTION_RE = re.compile(
 #: ``Ano XXXI``, ``Edição 717``, ``Número 42``, ``Nº 42``, ``Vol. 12``, ``No. 8``.
 #: A price is deliberately absent: it is corroboration, never identity.
 _ISSUE_METADATA_RE = re.compile(
+    # ``\d{1,3}(?:[.,]\d{3})*`` rather than ``\d{1,5}``: a daily prints its
+    # issue number with a thousands separator once it passes ten thousand, and
+    # "No. 42,812" is the ordinary form, not an exception.
     r"\b(?:ano\s+(?:[IVXLC]{1,7}|\d{1,4})"
-    r"|edi[cç][aã]o\s+n?[ºo°]?\s*\d{1,5}"
-    r"|n[ºo°]\s*\d{1,5}"
-    r"|n[uú]mero\s+\d{1,5}"
+    r"|edi[cç][aã]o\s+n?[ºo°]?\.?\s*\d{1,3}(?:[.,]\d{3})*"
+    r"|n[ºo°]\.?\s*\d{1,3}(?:[.,]\d{3})*"
+    r"|n[uú]mero\s+n?[ºo°]?\.?\s*\d{1,3}(?:[.,]\d{3})*"
     r"|year\s+(?:[IVXLC]{1,7}|\d{1,4})"
-    r"|(?:issue|edition)\s+n?o?\.?\s*\d{1,5}"
+    r"|(?:issue|edition)\s+(?:number\s+)?n?[o°]?\.?\s*\d{1,3}(?:[.,]\d{3})*"
     r"|vol(?:ume)?\.?\s*(?:[IVXLC]{1,7}|\d{1,4}))\b",
     re.IGNORECASE,
 )
 _PUBLICATION_DATE_RE = re.compile(
-    r"\b\d{1,2}\s+de\s+(?:janeiro|fevereiro|mar[cç]o|abril|maio|junho|julho|agosto|"
-    r"setembro|outubro|novembro|dezembro)\s+de\s+(?:19|20)\d{2}\b"
+    r"\b\d{1,2}\s*de\s*(?:janeiro|fevereiro|mar[cç]o|abril|maio|junho|julho|agosto|"
+    r"setembro|outubro|novembro|dezembro)\s*de\s*(?:19|20)\d{2}\b"
+    # ``\s*`` rather than ``\s+``: OCR of scanned newsprint drops inter-word
+    # spaces often enough that "NOVEMBER6,2020" is a normal reading of a
+    # correctly printed date. ``November6`` does not occur in typed text, so
+    # the tolerance costs nothing.
     r"|\b(?:january|february|march|april|may|june|july|august|september|october|"
-    r"november|december)\s+\d{1,2},?\s+(?:19|20)\d{2}\b"
+    r"november|december)\s*\d{1,2},?\s*(?:19|20)\d{2}\b"
     r"|\b\d{1,2}/\d{1,2}/(?:19|20)\d{2}\b",
     re.IGNORECASE,
 )
