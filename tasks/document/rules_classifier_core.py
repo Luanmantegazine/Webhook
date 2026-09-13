@@ -2984,11 +2984,40 @@ FAMILY_GATES: tuple[FamilyGate, ...] = (
                         "wire_service",
                         "attribution_quotes",
                         "multilingual_reporting",
-                        # v11, and only here: the weakest reading of "this
-                        # publication reports" is admitted once the other five
-                        # clauses of this path have already been met.
-                        "issue_reporting_language",
                     ),
+                ),
+                blockers=_NEWSPAPER_ISSUE_BLOCKERS,
+            ),
+            # v12. The OCR-recovery reading of the same document, as its own
+            # path rather than as a fifth alternative inside the one above.
+            #
+            # v11 admitted ``issue_reporting_language`` — two reporting verbs in
+            # a page-length body — into the masthead path's reporting clause,
+            # which fixed a scanned broadsheet whose byline, dateline and
+            # quotation marks the OCR had destroyed, and admitted a product
+            # catalogue with a nameplate, a domain, a column grid and two
+            # sentences of quoted sales copy. The five clauses that were
+            # supposed to make the relaxation safe are all satisfied by a
+            # catalogue, because a catalogue genuinely has them.
+            #
+            # What a catalogue does not have is newsprint geometry. So the weak
+            # lexical reading buys nothing on its own here: this path *requires*
+            # ``newspaper_column_geometry`` — measured narrative columns, not
+            # merely several columns on the page — alongside the nameplate and
+            # an identifying line. ``multi_column_publication`` is deliberately
+            # not an alternative to it, which is the whole difference between
+            # this path and the one above.
+            GatePath(
+                name="newspaper_issue_masthead_ocr_recovery",
+                all_of=(
+                    "publication_masthead",
+                    "multiple_headlines",
+                    "multiple_article_clusters",
+                    "newspaper_column_geometry",
+                    "issue_reporting_language",
+                ),
+                any_of=(
+                    ("issue_metadata", "publication_date", "publication_url"),
                 ),
                 blockers=_NEWSPAPER_ISSUE_BLOCKERS,
             ),
@@ -3014,7 +3043,20 @@ FAMILY_GATES: tuple[FamilyGate, ...] = (
                     # that it reports.
                     ("attribution_quotes", "multilingual_reporting"),
                 ),
-                blockers=_NEWSPAPER_ISSUE_BLOCKERS,
+                # v12: one guard the masthead paths do not carry. A running
+                # header is a weaker identity than a nameplate — it is any line
+                # repeated at the top of every page, which is exactly what a
+                # journal article's running title is — so an academic paper
+                # with columns, section headings and four reporting verbs was
+                # being promoted to a newspaper issue. The guard is written
+                # here rather than on the family because an *issue* may print
+                # citations and scientific content without being a
+                # publication; a document with no nameplate and a repeated
+                # academic title may not.
+                blockers=(
+                    *_NEWSPAPER_ISSUE_BLOCKERS,
+                    "research_publication_evidence",
+                ),
             ),
             GatePath(
                 name="byline_with_reporting",
@@ -3074,24 +3116,37 @@ FAMILY_GATES: tuple[FamilyGate, ...] = (
             "contains advertisements, letters, coupons and reference lists without "
             "being any of them."
             "\n\n"
-            "v11 widens the reporting clause of ``newspaper_issue_masthead`` "
-            "alone, with ``issue_reporting_language``: two reporting verbs in a "
-            "page-length body. Dense newsprint is where OCR fails hardest — the "
-            "small-caps ``BY`` is read into the name or lost, names fragment, the "
-            "edition line and the date corrupt, and quotation marks come back as "
-            "apostrophes — so the strongest journalistic markers can be "
-            "unreadable rather than absent. The evidence is deliberately weak, "
-            "which is why it is admitted only where five independent clauses are "
-            "already satisfied: a nameplate, an identifying line, several "
-            "headlines, several article clusters and a newspaper column grid. "
-            "``newspaper_issue_running_header`` keeps the narrower clause, "
-            "because with no nameplate the reporting language is doing more of "
-            "the work, and neither single-article path admits it at all."
+            "``issue_reporting_language`` — two reporting verbs in a page-length "
+            "body — reads the scanned broadsheet whose byline, dateline and "
+            "quotation marks the OCR destroyed: dense newsprint is where OCR "
+            "fails hardest, so the strongest journalistic markers can be "
+            "unreadable rather than absent. v11 admitted it into the masthead "
+            "path's reporting clause; v12 gives it a path of its own, "
+            "``newspaper_issue_masthead_ocr_recovery``, because the five clauses "
+            "around it were also satisfied by a product catalogue with a "
+            "nameplate, a domain and a column grid. The recovery path therefore "
+            "*requires* ``newspaper_column_geometry`` — measured narrative "
+            "columns rather than merely several columns — which is the one thing "
+            "a catalogue does not have; ``multi_column_publication`` is not an "
+            "alternative to it there. The original path is unchanged and still "
+            "accepts an issue on a byline, a wire credit, quoted attribution or "
+            "four reporting verbs, with no geometry required."
+            "\n\n"
+            "``newspaper_issue_running_header`` carries one guard the masthead "
+            "paths do not: ``research_publication_evidence``. A running header "
+            "is a weaker identity than a nameplate — any line repeated at the "
+            "top of every page, which is what a journal article\u2019s running "
+            "title is — so that path must refuse dominant academic evidence. The "
+            "guard is per path, not per family: an issue may print citations and "
+            "scientific content without ceasing to be a newspaper, while a "
+            "document with no nameplate and a repeated academic title was never "
+            "one."
         ),
         path_subtypes=(
             ("byline_with_reporting", "single_news_article"),
             ("wire_and_dateline_with_reporting", "single_news_article"),
             ("newspaper_issue_masthead", "newspaper_issue"),
+            ("newspaper_issue_masthead_ocr_recovery", "newspaper_issue"),
             ("newspaper_issue_running_header", "newspaper_issue"),
         ),
         metric_keys=(
@@ -3698,6 +3753,14 @@ def _rule_fingerprint() -> str:
 #: rule, a weight, a gate, a blocker or a family threshold moves it.
 RULE_FINGERPRINT = _rule_fingerprint()
 
+#: v12: the OCR-recovery reading of a newspaper issue becomes its own gate
+#: path, ``newspaper_issue_masthead_ocr_recovery``, which requires measured
+#: newsprint column geometry — the one thing a product catalogue with a
+#: nameplate does not have — and ``newspaper_issue_running_header`` gains
+#: ``research_publication_evidence`` as a path blocker, because a repeated
+#: academic title is not a publication identity. No feature, weight or
+#: threshold moved.
+#:
 #: v11: ``news_article.issue_reporting_language`` — two reporting verbs in a
 #: page-length body — is admitted as the weakest reading of "this publication
 #: reports", in the ``newspaper_issue_masthead`` path only, where five
@@ -3725,7 +3788,7 @@ RULE_FINGERPRINT = _rule_fingerprint()
 #: newspaper structure and column features; and financial guards that stop a
 #: dialling code, a run of month names or a page of advertised prices from
 #: reading as accounting evidence.
-CLASSIFIER_VERSION = f"rules-rvl-cdip-v11+{RULE_FINGERPRINT}"
+CLASSIFIER_VERSION = f"rules-rvl-cdip-v12+{RULE_FINGERPRINT}"
 
 
 def available_channels(features: dict) -> frozenset[str]:

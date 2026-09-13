@@ -1,7 +1,8 @@
 {
   "provenance": {
+    "fixture_kind": "reconstructed_from_production_metrics",
     "document": "Complete front page of The New York Times, scanned.",
-    "source": "Feature record reported by the production workflow (YOLO DocLayNet regions + docTR OCR), not re-extracted in this repository.",
+    "source": "Reconstructed from the metrics the production workflow (YOLO DocLayNet regions + docTR OCR) reported for this page. It is NOT a full capture of that run: the reported keys below are its measurements, the declared keys were filled in here so the record is loadable, and the page text was not stored. Running the v9 classifier on it reproduces the reported result exactly, which is what it is good for.",
     "observed_with": "rules-rvl-cdip-v9+8a9991b39a34",
     "observed_result": {
       "document_family": "other",
@@ -37,7 +38,8 @@
       "publication_date_count": 0,
       "issue_metadata_count": 0,
       "reporting_verb_count": 2
-    }
+    },
+    "replace_when": "Once YOLO + docTR can run here, replace this file with the classification_features persisted directly by the real execution, and change fixture_kind to captured_from_production_run."
   },
   "features": {
     "publication_masthead_count": 1,

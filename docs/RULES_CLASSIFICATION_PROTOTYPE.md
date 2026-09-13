@@ -133,7 +133,7 @@ Example result:
   "schema_version": "2.1",
   "taxonomy_version": "rvl-cdip-2.0",
   "feature_extraction_version": "2.6",
-  "classifier_version": "rules-rvl-cdip-v11+<rule_fingerprint>",
+  "classifier_version": "rules-rvl-cdip-v12+<rule_fingerprint>",
   "rule_fingerprint": "<12 hex>",
   "feature_fingerprint": "ff-<12 hex>",
   "classifier": "rules",
@@ -219,7 +219,7 @@ distinction.
 | `form_structured` | **A** questionnaire heading + 1 structural signal · **B** checkboxes + 1 structural signal · **C** form heading + 2 structural signals | `field_labels`, `label_value_lines`, `tab_stop_alignment`, `field_geometry_regularity`, `short_field_regions`, `blank_fields` | invoices, specifications, news, advertisements, budgets, resumes |
 | `correspondence` | two independent signals among header block, e-mail markers, salutation, closing, memo heading, letter geometry, letter body | — | forms, news reporting |
 | `research_paper` | two of: academic structure, citations, editorial metadata, academic layout | `academic_vocabulary` | news reporting, invoices, forms |
-| `news_article` | **A** byline + reporting · **B** wire service + dateline + reporting · **C** masthead + publication identity + editorial structure + layout + reporting (including `issue_reporting_language`) · **D** running header + editorial structure + layout + reporting | `attribution_quotes`, `multilingual_reporting`, `justified_body`, `multi_column_body`, `multi_column_publication`, `newspaper_column_geometry` | scientific publications, advertisements, forms, institutional correspondence, press releases |
+| `news_article` | **A** byline + reporting · **B** wire service + dateline + reporting · **C** masthead + publication identity + editorial structure + layout + strong reporting · **C′** masthead + identity + structure + **newsprint geometry** + `issue_reporting_language` · **D** running header + structure + layout + reporting, *minus* academic evidence | `attribution_quotes`, `multilingual_reporting`, `justified_body`, `multi_column_body`, `multi_column_publication`, `newspaper_column_geometry` | scientific publications, advertisements, forms, institutional correspondence, press releases |
 | `presentation_marketing` | **A** deck vocabulary (`presentation_terms`) **and** one visual/structural corroboration · **B** a call **and** an identified event **and** one organisation signal **and** one page shape | `visual_layout`, `landscape_layout`, `visual_dominance`, `sparse_centered`, `slide_structure`, `event_logistics`, `event_organization`, `submission_instructions`, `event_announcement_layout`, `marketing_copy` | near-empty OCR, low-confidence OCR, forms, invoices; path **B** additionally: news reporting, reported speech |
 
 Consequences worth stating explicitly, because each was a measured failure:
@@ -401,18 +401,46 @@ have less around them. The single-article paths and
 `newspaper_issue_running_header` do not admit the new rule at all — with no
 nameplate the reporting language is doing more of the work there.
 
-**The safety argument, and where it ends.** The relaxation applies only where
-five independent clauses are already satisfied: a nameplate, an identifying
-line, several headlines, several article clusters and a newspaper column grid.
-That is what makes it defensible for a scanned issue — and it is also
-satisfied by a product catalogue with a large nameplate, a domain and a column
-grid, which needs only two reporting verbs in its copy to open the path.
-`GateIsolationTests.test_known_cost_a_catalogue_that_quotes_its_own_managers`
-records that case as an expected failure rather than leaving it undiscovered:
-it asserts the behaviour we want, fails today, and will report an unexpected
-success the moment a guard closes it. Closing it needs a discriminator this
-change does not have — narrative column geometry, or a path split — and both
-are more than a minimal change.
+**The safety argument, and where v11 put it.** v11 admitted the rule into the
+masthead path's reporting clause, arguing that five independent clauses were
+already satisfied: a nameplate, an identifying line, several headlines,
+several article clusters and a newspaper column grid. A product catalogue has
+all five — a large nameplate, a domain, headed blocks, a column grid — so two
+sentences of quoted sales copy were enough to make one a newspaper issue.
+
+### v12: the recovery reading gets its own path, and a geometry clause
+
+The weak lexical reading is now a path of its own rather than a fifth
+alternative inside the strong one:
+
+| Path | Requires | Reporting clause |
+| --- | --- | --- |
+| `newspaper_issue_masthead` | masthead + headlines + clusters, one layout signal, one identity signal | byline · wire service · attribution quotes · `multilingual_reporting` |
+| `newspaper_issue_masthead_ocr_recovery` | masthead + headlines + clusters + **`newspaper_column_geometry`** + `issue_reporting_language`, one identity signal | — it *is* the path's requirement |
+
+The difference that does the work is `newspaper_column_geometry`: measured
+narrative columns, not merely several columns on the page.
+`multi_column_publication` is deliberately not an alternative to it there,
+because a catalogue's grid satisfies that and a catalogue's page geometry does
+not read as newsprint. The strong path is untouched and still accepts an issue
+with no geometry measurement at all, as long as something journalistic is
+readable. Both paths report `newspaper_issue`, and the recovery path's
+cheapest satisfying set scores 1.2647 against 0.60.
+
+### v12: a running title is not a publication identity
+
+The other false positive entered by `newspaper_issue_running_header`: an
+academic journal article prints its title at the top of every page, which is
+what `repeated_publication_header` measures, and with columns, section
+headings and four reporting verbs it satisfied that path outright. The path
+now carries `research_publication_evidence` as its own blocker, in addition to
+the newspaper-issue blockers.
+
+The guard is deliberately on the path and not on the family. An issue may
+print citations, a science page and a book review without ceasing to be a
+newspaper — that is why the newspaper paths dropped the document-wide guards
+in v8 — but a document with no nameplate whose only identity is a repeated
+academic title was never one. The masthead paths do not carry it.
 
 ### The masthead is typographic; identity is separate
 
@@ -1014,7 +1042,7 @@ registration due date. The near misses are non-vacuous: each fires
 `event_identity`, and the newspaper meets every requirement of the path and is
 stopped by `reported_speech_evidence`.
 
-`tests/test_issue_reporting_language.py` covers v11: the real front page as a
+`tests/test_issue_reporting_language.py` covers v11 and v12: the real front page as a
 recorded feature record (`tests/fixtures/nyt_front_page_features.json`, whose
 `provenance` block says which keys the production run reported, which were
 declared to make the record loadable, and why the page text is not carried),
@@ -1025,7 +1053,13 @@ restriction read off `FAMILY_GATES`, and the documents the widened clause must
 still refuse — a long reporting text with no nameplate, a technical report, a
 catalogue, a press release, an event announcement, and an academic article
 whose "reported" and "according to" fire the new rule while the gate blocks it
-on `research_publication_evidence`.
+on `research_publication_evidence`. v12 adds the geometry control — two
+feature vectors differing in `newspaper_column_geometry_ratio` alone, refused
+at 0.0 and accepted at 0.50 — the catalogue as an ordinary passing test rather
+than an expected failure, the strong path still opening on a byline with the
+weak rule false, the academic running-header adversarial blocked on the path
+it enters by, and a masthead-less newspaper still classifying through
+`newspaper_issue_running_header`.
 
 `tests/test_family_gates.py` covers the v6 gates. Each test encodes a failure
 the development run actually produced: visual-only evidence refused with
