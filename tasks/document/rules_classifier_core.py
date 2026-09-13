@@ -281,7 +281,10 @@ _YEAR_RANGE_RE = re.compile(
 # Brazilian newspaper had no byline at all as far as the classifier was
 # concerned, which is a property of the pattern and not of the document.
 _BYLINE_RE = re.compile(
-    r"^[ \t]*(?:[Bb]y|[Pp]or)\s+"
+    # ``BY``/``POR`` in full capitals is the ordinary newspaper setting for a
+    # byline, so the case of the introducer is not discriminating; the case of
+    # the *name* after it still is.
+    r"^[ \t]*(?:[Bb][Yy]|[Pp][Oo][Rr])\s+"
     # An optional role or title before the name: "Por Jornalista João Silva".
     r"(?:[A-ZÀ-Ý][\wÀ-ÿ.'’-]+\s+){0,2}"
     r"[A-ZÀ-Ý][\wÀ-ÿ.'’-]+\s+[A-ZÀ-Ý][\wÀ-ÿ.'’-]+"
@@ -327,20 +330,27 @@ _QUOTE_ATTRIBUTION_RE = re.compile(
 #: ``Ano XXXI``, ``Edição 717``, ``Número 42``, ``Nº 42``, ``Vol. 12``, ``No. 8``.
 #: A price is deliberately absent: it is corroboration, never identity.
 _ISSUE_METADATA_RE = re.compile(
+    # ``\d{1,3}(?:[.,]\d{3})*`` rather than ``\d{1,5}``: a daily prints its
+    # issue number with a thousands separator once it passes ten thousand, and
+    # "No. 42,812" is the ordinary form, not an exception.
     r"\b(?:ano\s+(?:[IVXLC]{1,7}|\d{1,4})"
-    r"|edi[cç][aã]o\s+n?[ºo°]?\s*\d{1,5}"
-    r"|n[ºo°]\s*\d{1,5}"
-    r"|n[uú]mero\s+\d{1,5}"
+    r"|edi[cç][aã]o\s+n?[ºo°]?\.?\s*\d{1,3}(?:[.,]\d{3})*"
+    r"|n[ºo°]\.?\s*\d{1,3}(?:[.,]\d{3})*"
+    r"|n[uú]mero\s+n?[ºo°]?\.?\s*\d{1,3}(?:[.,]\d{3})*"
     r"|year\s+(?:[IVXLC]{1,7}|\d{1,4})"
-    r"|(?:issue|edition)\s+n?o?\.?\s*\d{1,5}"
+    r"|(?:issue|edition)\s+(?:number\s+)?n?[o°]?\.?\s*\d{1,3}(?:[.,]\d{3})*"
     r"|vol(?:ume)?\.?\s*(?:[IVXLC]{1,7}|\d{1,4}))\b",
     re.IGNORECASE,
 )
 _PUBLICATION_DATE_RE = re.compile(
-    r"\b\d{1,2}\s+de\s+(?:janeiro|fevereiro|mar[cç]o|abril|maio|junho|julho|agosto|"
-    r"setembro|outubro|novembro|dezembro)\s+de\s+(?:19|20)\d{2}\b"
+    r"\b\d{1,2}\s*de\s*(?:janeiro|fevereiro|mar[cç]o|abril|maio|junho|julho|agosto|"
+    r"setembro|outubro|novembro|dezembro)\s*de\s*(?:19|20)\d{2}\b"
+    # ``\s*`` rather than ``\s+``: OCR of scanned newsprint drops inter-word
+    # spaces often enough that "NOVEMBER6,2020" is a normal reading of a
+    # correctly printed date. ``November6`` does not occur in typed text, so
+    # the tolerance costs nothing.
     r"|\b(?:january|february|march|april|may|june|july|august|september|october|"
-    r"november|december)\s+\d{1,2},?\s+(?:19|20)\d{2}\b"
+    r"november|december)\s*\d{1,2},?\s*(?:19|20)\d{2}\b"
     r"|\b\d{1,2}/\d{1,2}/(?:19|20)\d{2}\b",
     re.IGNORECASE,
 )
@@ -2140,6 +2150,32 @@ def _low_quality_ocr(ctx: _Context) -> bool:
     return not _visual_page(ctx) and ctx.flt("landscape_ratio") < 0.5
 
 
+def _predominantly_advertising_evidence(ctx: _Context) -> bool:
+    """Advertising *is* this document, rather than being a page inside it.
+
+    ``advertisement_evidence`` asks whether advertising copy is present, which
+    is the right question for a single article and the wrong one for a
+    publication: every newspaper carries advertisements, so presence proves
+    nothing about the document as a whole. This asks about dominance instead —
+    marketing language dense enough to be the point of the page — and lets
+    genuine journalistic structure rebut it, because an issue with articles
+    across several pages is not an advertising circular however many
+    advertisements it prints.
+    """
+    words = ctx.num("word_count")
+    if not words or not _advertisement_evidence(ctx):
+        return False
+    density = ctx.num("marketing_term_count") * 1000.0 / words
+    if density < 4.0:
+        return False
+    rebutted_by_structure = (
+        ctx.num("article_cluster_count") >= 6
+        or ctx.num("newspaper_page_count") >= 2
+        or ctx.num("quotation_attribution_count") >= 2
+    )
+    return not rebutted_by_structure
+
+
 def _presentation_text_too_sparse(ctx: _Context) -> bool:
     """Too little recognised text to support a presentation claim.
 
@@ -2178,6 +2214,11 @@ BLOCKERS: tuple[Blocker, ...] = (
     Blocker("resume_evidence", _resume_evidence, "CV heading, or experience and education sections."),
     Blocker("budget_evidence", _budget_evidence, "Accounting vocabulary over a dense numeric grid."),
     Blocker("advertisement_evidence", _advertisement_evidence, "Marketing copy, or marketing copy on a visual page."),
+    Blocker(
+        "predominantly_advertising_evidence",
+        _predominantly_advertising_evidence,
+        "Marketing copy dense enough to be the document, with no journalistic structure to rebut it.",
+    ),
     Blocker(
         "research_publication_evidence",
         _research_publication_evidence,
@@ -2224,12 +2265,22 @@ class GatePath(NamedTuple):
     structural signal" and "a form heading with two corroborating signals" are
     different cases with different evidence bars, and writing them as one
     threshold over a bag of rules loses exactly that distinction.
+
+    ``blockers``
+        Guards that veto *this path*. ``None`` inherits the family's blockers,
+        which is what a path wants when it describes a whole document. A path
+        that describes a **container** needs its own, shorter list: a newspaper
+        issue carries advertisements, letters to the editor, coupons and
+        reference lists, and a document-wide guard written for a single article
+        reads each of those as proof that the document is something else. An
+        empty tuple declares, explicitly, that no guard applies.
     """
 
     name: str
     all_of: tuple[str, ...] = ()
     any_of: tuple[tuple[str, ...], ...] = ()
     min_units: tuple[tuple[int, tuple[tuple[str, ...], ...]], ...] = ()
+    blockers: tuple[str, ...] | None = None
 
 
 class FamilyGate(NamedTuple):
@@ -2303,6 +2354,23 @@ _CORRESPONDENCE_SIGNALS: tuple[str, ...] = (
 #: presentation. ``marketing_copy`` is deliberately not here — on the
 #: development set it fired exactly once, for an invoice — and
 #: ``slide_structure`` moved out, for the reason recorded beside the rule.
+#: Guards that apply to a whole *publication*, as opposed to a single article.
+#:
+#: The family's own blocker list is written for one document with one subject:
+#: advertising copy, a salutation, a form field or a reference list each say
+#: "this is not journalism". A newspaper issue is a container, and every one of
+#: those appears inside a perfectly ordinary issue — the advertisements pay for
+#: it, the letters page is correspondence, the coupon is a form, the book
+#: review carries citations. Applying document-wide guards to a container reads
+#: its contents as proof that the container is something else.
+#:
+#: What survives here is the one guard that is about the document rather than
+#: about something inside it: advertising *dominating* the page, with no
+#: journalistic structure to rebut it. ``press_release_evidence`` deliberately
+#: does not: a newspaper reprinting a press release is still a newspaper, while
+#: a single document that *is* a press release is not an article.
+_NEWSPAPER_ISSUE_BLOCKERS: tuple[str, ...] = ("predominantly_advertising_evidence",)
+
 _PRESENTATION_PRIMARY: tuple[str, ...] = ("presentation_terms",)
 
 #: Substitutable visual and structural shapes. One of them must corroborate the
@@ -2482,6 +2550,7 @@ FAMILY_GATES: tuple[FamilyGate, ...] = (
                     # evidence of reporting.
                     ("attribution_quotes", "multilingual_reporting"),
                 ),
+                blockers=_NEWSPAPER_ISSUE_BLOCKERS,
             ),
             GatePath(
                 name="newspaper_issue_running_header",
@@ -2498,6 +2567,7 @@ FAMILY_GATES: tuple[FamilyGate, ...] = (
                     ),
                     ("attribution_quotes", "multilingual_reporting"),
                 ),
+                blockers=_NEWSPAPER_ISSUE_BLOCKERS,
             ),
         ),
         primary=(
@@ -2539,7 +2609,10 @@ FAMILY_GATES: tuple[FamilyGate, ...] = (
             "attribution_quotes`` satisfies any path. Both newspaper paths "
             "additionally require reporting language: identity, structure and layout "
             "alone are satisfied by a product catalogue, and what makes a publication "
-            "journalistic is that it reports."
+            "journalistic is that it reports. The single-article paths keep the "
+            "document-wide guards; the newspaper paths do not, because an issue "
+            "contains advertisements, letters, coupons and reference lists without "
+            "being any of them."
         ),
         path_subtypes=(
             ("byline_with_reporting", "single_news_article"),
@@ -2728,6 +2801,14 @@ def _validate_gate_configuration() -> None:
         unknown_blockers = sorted(set(gate.blockers) - set(BLOCKER_PREDICATES))
         if unknown_blockers:
             raise ValueError(f"{gate.family}: unknown blocker(s) {unknown_blockers}")
+        for path in gate.paths:
+            if path.blockers is None:
+                continue
+            unknown_path_blockers = sorted(set(path.blockers) - set(BLOCKER_PREDICATES))
+            if unknown_path_blockers:
+                raise ValueError(
+                    f"{gate.family}/{path.name}: unknown blocker(s) {unknown_path_blockers}"
+                )
         unmapped = sorted(
             {name for name, _reason in gate.blocker_reasons} - set(gate.blockers)
         )
@@ -2794,34 +2875,63 @@ def evaluate_family_gates(
         primary_fired = sorted(name for name in gate.primary if name in fired)
         corroborating_fired = sorted(name for name in gate.corroborating if name in fired)
 
+        # Blockers are evaluated once per document and then applied per path:
+        # which guards *apply* is a property of the path, but whether a guard
+        # fires is a property of the document.
+        blocker_cache: dict[str, bool] = {}
+
+        def fires(name: str) -> bool:
+            if name not in blocker_cache:
+                try:
+                    blocker_cache[name] = bool(BLOCKER_PREDICATES[name].predicate(ctx))
+                except Exception:  # a malformed feature must not abort classification
+                    blocker_cache[name] = False
+            return blocker_cache[name]
+
         satisfied_paths: list[str] = []
         unsatisfied_paths: dict[str, list[str]] = {}
+        path_evaluations: dict[str, dict] = {}
+        blocked_by: list[str] = []
+        evaluated_blockers: list[str] = []
         for path in gate.paths:
-            ok, unmet = _evaluate_path(path, fired)
-            if ok:
-                satisfied_paths.append(path.name)
-            else:
-                unsatisfied_paths[path.name] = unmet
-
-        blocked_by = []
-        for name in gate.blockers:
-            blocker = BLOCKER_PREDICATES[name]
-            try:
-                if blocker.predicate(ctx):
+            requirements_met, unmet = _evaluate_path(path, fired)
+            path_blockers = gate.blockers if path.blockers is None else path.blockers
+            path_blocked_by = [name for name in path_blockers if fires(name)]
+            for name in path_blockers:
+                if name not in evaluated_blockers:
+                    evaluated_blockers.append(name)
+            for name in path_blocked_by:
+                if name not in blocked_by:
                     blocked_by.append(name)
-            except Exception:  # a malformed feature must not abort classification
-                continue
+            if requirements_met and not path_blocked_by:
+                satisfied_paths.append(path.name)
+            elif not requirements_met:
+                unsatisfied_paths[path.name] = unmet
+            path_evaluations[path.name] = {
+                "satisfied": requirements_met and not path_blocked_by,
+                "requirements_met": requirements_met,
+                "unmet_requirements": unmet,
+                # Recorded per path so a reader can see that a guard written
+                # for a single article was not applied to the whole publication.
+                "blockers_evaluated": list(path_blockers),
+                "blockers_inherited_from_family": path.blockers is None,
+                "blocked_by": path_blocked_by,
+                "subtype": dict(gate.path_subtypes).get(path.name),
+            }
 
         blocker_reasons = dict(gate.blocker_reasons)
         subtypes = dict(gate.path_subtypes)
         document_subtype = None
-        if blocked_by:
-            status = "blocked"
-            reason = blocker_reasons.get(blocked_by[0], f"blocked_by_{blocked_by[0]}")
-        elif satisfied_paths:
+        if satisfied_paths:
+            # A satisfied path wins over a guard that vetoed a *different* path:
+            # an advertisement inside a newspaper blocks the single-article
+            # reading and leaves the publication reading untouched.
             status = "satisfied"
             reason = f"path_{satisfied_paths[0]}"
             document_subtype = subtypes.get(satisfied_paths[0])
+        elif blocked_by:
+            status = "blocked"
+            reason = blocker_reasons.get(blocked_by[0], f"blocked_by_{blocked_by[0]}")
         elif corroborating_fired and not primary_fired and gate.reason_corroborating_only:
             # The v5 failure mode, named: evidence of the right shape but of
             # only one kind, which is a refusal and not a low score.
@@ -2842,6 +2952,8 @@ def evaluate_family_gates(
             "satisfied_paths": satisfied_paths,
             "satisfied_requirements": sorted(fired),
             "unsatisfied_paths": unsatisfied_paths,
+            "path_evaluations": path_evaluations,
+            "blockers_evaluated": evaluated_blockers,
             "missing_requirements": sorted(
                 {requirement for unmet in unsatisfied_paths.values() for requirement in unmet}
             ),
