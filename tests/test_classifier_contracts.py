@@ -86,8 +86,8 @@ def features_for(document):
 
 
 class VersionContractTests(unittest.TestCase):
-    def test_v8_identity(self):
-        self.assertTrue(CLASSIFIER_VERSION.startswith("rules-rvl-cdip-v8+"))
+    def test_v9_identity(self):
+        self.assertTrue(CLASSIFIER_VERSION.startswith("rules-rvl-cdip-v9+"))
         self.assertTrue(CLASSIFIER_VERSION.endswith(RULE_FINGERPRINT))
 
     def test_contract_versions(self):
@@ -102,11 +102,11 @@ class VersionContractTests(unittest.TestCase):
         """
         self.assertEqual(SCHEMA_VERSION, "2.1")
         self.assertEqual(TAXONOMY_VERSION, "rvl-cdip-2.1")
-        self.assertEqual(FEATURE_EXTRACTION_VERSION, "2.4")
+        self.assertEqual(FEATURE_EXTRACTION_VERSION, "2.5")
 
-    def test_feature_record_carries_the_v8_extraction_version(self):
+    def test_feature_record_carries_the_current_extraction_version(self):
         features = features_for(sample_documents()[0])
-        self.assertEqual(features["feature_extraction_version"], "2.4")
+        self.assertEqual(features["feature_extraction_version"], "2.5")
         self.assertEqual(
             features["feature_fingerprint"], core.feature_fingerprint(features)
         )
@@ -117,7 +117,7 @@ class VersionContractTests(unittest.TestCase):
         self.assertEqual(result["classifier_version"], CLASSIFIER_VERSION)
         self.assertEqual(result["rule_fingerprint"], RULE_FINGERPRINT)
         self.assertEqual(result["feature_fingerprint"], features["feature_fingerprint"])
-        self.assertEqual(result["feature_extraction_version"], "2.4")
+        self.assertEqual(result["feature_extraction_version"], "2.5")
 
     def test_subtype_is_present_and_optional(self):
         """Additive: the key is always there, ``None`` when it does not apply."""
@@ -128,11 +128,20 @@ class VersionContractTests(unittest.TestCase):
 
 
 class RoutingReleaseTests(unittest.TestCase):
-    def test_two_families_are_withheld_from_automatic_routing(self):
+    def test_families_withheld_from_automatic_routing(self):
+        """v9 adds news_article: its newspaper paths have no holdout."""
         self.assertEqual(
             FAMILIES_NOT_RELEASED_FOR_ROUTING,
-            frozenset({"financial_document", "presentation_marketing"}),
+            frozenset({"financial_document", "presentation_marketing", "news_article"}),
         )
+
+    def test_every_withheld_family_records_why(self):
+        from tasks.document.rules_classifier_core import ROUTING_RELEASE_NOTES
+
+        for family in FAMILIES_NOT_RELEASED_FOR_ROUTING:
+            with self.subTest(family=family):
+                self.assertTrue(ROUTING_RELEASE_NOTES.get(family))
+        self.assertIn("holdout", ROUTING_RELEASE_NOTES["news_article"])
 
     def test_no_family_is_marked_production_ready(self):
         self.assertTrue(
@@ -148,6 +157,139 @@ class RoutingReleaseTests(unittest.TestCase):
                 result = classify_with_rules(features_for(document))
                 self.assertFalse(result["released_for_automatic_routing"])
                 self.assertIn("routing_release_status", result)
+
+
+class GatePathReachabilityTests(unittest.TestCase):
+    """Every declared path must be able to reach the bar it is judged against.
+
+    A gate that opens on a combination the scorer cannot carry to the threshold
+    is a path that exists on paper and classifies nothing: the document passes
+    the gate, scores below the bar, and is refused with a reason that describes
+    the score rather than the cause. v8 shipped exactly that for
+    ``byline + multilingual_reporting`` — 0.5882 against 0.60.
+    """
+
+    #: Paths known to be unreachable, with the numbers, so that a *new* one
+    #: fails this test instead of joining a silent backlog. Both pre-date v9
+    #: and both need a decision — a weight change or a threshold change — in a
+    #: family this round was explicitly scoped away from, so neither is fixed
+    #: here rather than adjusted without measurement.
+    KNOWN_UNREACHABLE = {
+        # citations (0.14) + two_column_layout (0.08) = 0.22 / 0.69 = 0.3188
+        # against a 0.43 development-set threshold.
+        ("research_paper", "two_independent_academic_groups"),
+        # presentation_terms (0.18) + sparse_centered (0.12) = 0.30 / 0.62
+        # = 0.4839 against the global 0.60.
+        ("presentation_marketing", "deck_vocabulary_with_visual_support"),
+    }
+
+    def setUp(self):
+        self.rows = core.check_gate_path_reachability()
+
+    def test_every_news_article_path_is_reachable(self):
+        for row in self.rows:
+            if row["family"] != "news_article":
+                continue
+            with self.subTest(path=row["path"]):
+                self.assertTrue(
+                    row["reachable"],
+                    f"{row['path']} minimally scores {row['score']} "
+                    f"against {row['threshold']}: {row['minimal_rules']}",
+                )
+
+    def test_no_new_path_is_unreachable(self):
+        unreachable = {
+            (row["family"], row["path"]) for row in self.rows if not row["reachable"]
+        }
+        self.assertEqual(
+            unreachable,
+            self.KNOWN_UNREACHABLE,
+            "a gate path changed reachability; fix it or record it deliberately",
+        )
+
+    def test_the_check_reports_a_minimal_combination_that_clears(self):
+        row = next(
+            item for item in self.rows if item["path"] == "byline_with_reporting"
+        )
+        # The cheapest satisfying set, not the strongest: the weakest accepting
+        # combination is the one a real document presents. Which member of the
+        # reporting group it names is a tie-break — they now weigh the same —
+        # so the assertion is on the shape and the outcome.
+        self.assertIn("byline", row["minimal_rules"])
+        self.assertEqual(len(row["minimal_rules"]), 2)
+        self.assertGreaterEqual(row["score"], row["threshold"])
+
+    def test_the_v8_failing_combination_now_clears(self):
+        """``byline + multilingual_reporting`` scored 0.5882 against 0.60."""
+        indicators = {
+            rule_id: rule_id
+            in {"news_article.byline", "news_article.multilingual_reporting"}
+            for rule_id in core.RULE_IDS
+        }
+        score = core.score_families(
+            {"measured_page_ratio": 1.0, "geometry_page_ratio": 1.0, "total_pages": 1},
+            indicators,
+        )["news_article"]["score"]
+        self.assertGreaterEqual(score, DEFAULT_CONFIDENCE_THRESHOLD)
+
+
+class ScoreContractTests(unittest.TestCase):
+    """One documented contract: unclipped ratio for ranking, clipped confidence.
+
+    The evaluator ranks on ``score`` and computes margins from
+    ``candidate_scores``; both are evidence ratios and both may exceed 1 when a
+    document carries more than a sufficient case. Clipping them would make two
+    strongly evidenced families meet at the ceiling and produce a zero margin,
+    which is the ambiguity the margin exists to detect. ``confidence`` is the
+    reporting value and is clipped to [0, 1].
+    """
+
+    def well_evidenced_document(self):
+        def region(text, class_name, index):
+            return {
+                "class_name": class_name,
+                "text": text,
+                "bbox": [80, 80 + index * 140, 1120, 200 + index * 140],
+            }
+
+        return {
+            "total_pages": 1,
+            "pages": [
+                {
+                    "page_number": 1,
+                    "regions": [
+                        region("INVOICE 9381", "Title", 0),
+                        region("Bill To: Example Ltd\nRemit to: Example Bank", "Text", 1),
+                        region(
+                            "Subtotal $100.00\nTax $10.00\nTotal Due $110.00\n"
+                            "Amount due on receipt. Balance sheet, ledger and "
+                            "disbursements recorded; accounts payable audited.",
+                            "Text",
+                            2,
+                        ),
+                        region(
+                            "Invoices, receipts and expenditures for January, "
+                            "February and March are attached, with unit price and "
+                            "subtotal per line: $12.00, $18.50, $44.25.",
+                            "Text",
+                            3,
+                        ),
+                    ],
+                }
+            ],
+            "full_text": "",
+        }
+
+    def test_score_may_exceed_one_while_confidence_may_not(self):
+        result = classify_with_rules(features_for(self.well_evidenced_document()))
+        self.assertGreater(result["score"], 1.0)
+        self.assertGreater(max(result["candidate_scores"].values()), 1.0)
+        self.assertLessEqual(result["confidence"], 1.0)
+        self.assertEqual(result["confidence"], min(round(result["score"], 4), 1.0))
+
+    def test_the_module_documents_the_contract(self):
+        self.assertIn("may exceed 1", core.__doc__)
+        self.assertIn("confidence", core.__doc__)
 
 
 class FingerprintSensitivityTests(unittest.TestCase):

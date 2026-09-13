@@ -203,6 +203,128 @@ class SingleArticleTests(unittest.TestCase):
         self.assertEqual(result["document_subtype"], "single_news_article")
 
 
+class PageWordRecoveryTests(unittest.TestCase):
+    """Editorial signals the layout detector left outside every region.
+
+    The reported failure: a real front page with 8 headlines, 8 article
+    clusters and 6 columns scored 0.5588 and was refused, because the masthead,
+    the dateline, the edition line and the bylines were not inside any region
+    the detector produced. They were in ``page_words`` the whole time, feeding
+    the geometry features and nothing else.
+    """
+
+    def page_with_furniture_outside_regions(self):
+        """Body text in regions; nameplate and editorial line only in words."""
+        regions = []
+        top = 300
+        for index, (left, right) in enumerate(COLUMNS):
+            regions.append(
+                region(f"Council approves works {index}", "Section-header", [left, top, right, top + 60])
+            )
+            regions.append(region(EN_LEAD, "Text", [left, top + 70, right, top + 900]))
+            # A second story in the same column, so the page carries the four
+            # headlines and three clusters a front page has.
+            regions.append(
+                region(f"Transport tender closes {index}", "Section-header", [left, top + 910, right, top + 970])
+            )
+            regions.append(region(EN_SECOND, "Text", [left, top + 980, right, top + 1350]))
+        document = {
+            "total_pages": 1,
+            "pages": [{"page_number": 1, "regions": regions}],
+            "full_text": "",
+        }
+
+        def word(text, x0, y0, x1, y1):
+            return {"text": text, "bbox": [x0, y0, x1, y1], "confidence": 0.9}
+
+        # The nameplate: large type across the top band. Deliberately misread,
+        # the way a blackletter nameplate is misread by every OCR engine.
+        words = [
+            word("Che", 300, 60, 520, 180),
+            word("Regional", 540, 60, 900, 180),
+            word("Baily", 920, 60, 1140, 180),
+            # The editorial line under it, at body size.
+            word("INTERNATIONAL", 300, 210, 470, 240),
+            word("EDITION", 480, 210, 580, 240),
+            word("Issue", 600, 210, 660, 240),
+            word("42812", 670, 210, 750, 240),
+            word("January", 770, 210, 870, 240),
+            word("24,", 880, 210, 920, 240),
+            word("2026", 930, 210, 1000, 240),
+            word("www.regionaldaily.com", 1010, 210, 1160, 240),
+            # A byline, in capitals, with two authors.
+            word("BY", 80, 260, 110, 290),
+            word("JANE", 120, 260, 200, 290),
+            word("ROBERTS", 210, 260, 340, 290),
+            word("AND", 350, 260, 400, 290),
+            word("ALEX", 410, 260, 480, 290),
+            word("BURNS", 490, 260, 570, 290),
+        ]
+        return document, [words]
+
+    def classify_with_words(self, document, page_words):
+        features = extract_classification_features(
+            document,
+            page_sizes=[[PAGE_WIDTH, PAGE_HEIGHT]],
+            page_words=page_words,
+        )
+        return features, classify_with_rules(features, include_indicators=True)
+
+    def test_without_page_words_the_furniture_is_invisible(self):
+        """The reported failure, reproduced: regions alone are not enough."""
+        document, _words = self.page_with_furniture_outside_regions()
+        features, result = classify(document, pages=1)
+        self.assertEqual(features["publication_masthead_count"], 0)
+        self.assertEqual(features["issue_metadata_count"], 0)
+        self.assertEqual(features["byline_count"], 0)
+        self.assertNotEqual(result["document_family"], "news_article")
+
+    def test_page_words_recover_every_editorial_signal(self):
+        document, words = self.page_with_furniture_outside_regions()
+        features, _result = self.classify_with_words(document, words)
+        self.assertGreaterEqual(features["publication_masthead_count"], 1)
+        self.assertGreaterEqual(features["masthead_word_candidate_count"], 1)
+        self.assertGreaterEqual(features["issue_metadata_count"], 1)
+        self.assertGreaterEqual(features["publication_date_count"], 1)
+        self.assertGreaterEqual(features["publication_url_count"], 1)
+        self.assertGreaterEqual(features["byline_count"], 1)
+
+    def test_the_page_is_classified_once_the_signals_are_recovered(self):
+        document, words = self.page_with_furniture_outside_regions()
+        _features, result = self.classify_with_words(document, words)
+        self.assertEqual(result["document_family"], "news_article")
+        self.assertEqual(result["document_subtype"], "newspaper_issue")
+        self.assertEqual(news_gate(result)["reason"], "path_newspaper_issue_masthead")
+
+    def test_a_misread_nameplate_is_still_a_nameplate(self):
+        """"Che Regional Baily" is the same typographic object as the truth."""
+        document, words = self.page_with_furniture_outside_regions()
+        features, _result = self.classify_with_words(document, words)
+        self.assertGreaterEqual(features["masthead_word_candidate_count"], 1)
+        # Nothing in the detector read the name: it is size and position only.
+        self.assertEqual(features["masthead_region_count"], 0)
+
+    def test_the_two_streams_are_combined_with_max_not_sum(self):
+        """A line read by both streams counts once."""
+        document, words = self.page_with_furniture_outside_regions()
+        # Put the byline in a region as well as in the words.
+        document["pages"][0]["regions"].append(
+            region("BY JANE ROBERTS AND ALEX BURNS", "Text", [80, 260, 570, 290])
+        )
+        features, _result = self.classify_with_words(document, words)
+        self.assertEqual(features["byline_count"], 1)
+
+    def test_page_word_text_does_not_inflate_word_count(self):
+        """The recovered stream must not be appended to classification_text."""
+        document, words = self.page_with_furniture_outside_regions()
+        without, _r1 = classify(document, pages=1)
+        with_words, _r2 = self.classify_with_words(document, words)
+        self.assertEqual(with_words["word_count"], without["word_count"])
+        self.assertEqual(
+            with_words["classification_text"], without["classification_text"]
+        )
+
+
 class CompositeDocumentTests(unittest.TestCase):
     """A newspaper contains other kinds of document without becoming them.
 
@@ -635,19 +757,45 @@ class ScannedNewsprintConventionTests(unittest.TestCase):
                 self.assertTrue(_PUBLICATION_DATE_RE.search(line), line)
         self.assertIsNone(_PUBLICATION_DATE_RE.search("November 2020 was the month"))
 
-    def test_a_masthead_needs_more_than_a_dominant_title(self):
-        """The nameplate alone is a cover; the metadata beside it is the identity."""
+    def test_masthead_detection_is_typographic_only(self):
+        """v9 splits the nameplate from the identity that used to be inside it.
+
+        The detector answers "does this look like a nameplate" — size, width,
+        position — and nothing else. Requiring editorial metadata *inside* it
+        meant a mangled edition line stopped the nameplate from being a
+        nameplate at all. Identity is now a separate clause of the gate, which
+        is both stricter to read and easier to satisfy correctly.
+        """
         from tasks.document.rules_classifier_core import _detect_masthead
 
         nameplate = region("THE REGIONAL DAILY", "Title", [80, 60, 1100, 230])
-        self.assertFalse(_detect_masthead([nameplate], 1240, 1750))
-        with_price_only = [nameplate, region("$1.00", "Text", [80, 250, 300, 290])]
-        self.assertFalse(_detect_masthead(with_price_only, 1240, 1750))
-        with_identity = [
-            nameplate,
-            region("Issue Number No. 42,812", "Text", [80, 250, 700, 290]),
-        ]
-        self.assertTrue(_detect_masthead(with_identity, 1240, 1750))
+        self.assertTrue(_detect_masthead([nameplate], 1240, 1750))
+        # Still typographic: a small line at the top is not a nameplate.
+        small = region("the regional daily", "Text", [80, 60, 300, 80])
+        self.assertFalse(_detect_masthead([small], 1240, 1750))
+        # Nor is a dominant title halfway down the page.
+        low = region("THE REGIONAL DAILY", "Title", [80, 900, 1100, 1070])
+        self.assertFalse(_detect_masthead([low], 1240, 1750))
+
+    def test_a_nameplate_without_identity_does_not_open_the_gate(self):
+        """What the old conflation protected against, now enforced by the gate."""
+        document = newspaper_issue(pages=4)
+        for page in document["pages"]:
+            page["regions"] = [
+                item
+                for item in page["regions"]
+                if "Edi\u00e7\u00e3o" not in item["text"]
+                and "Issue" not in item["text"]
+                and "www." not in item["text"]
+                and "de janeiro de" not in item["text"]
+            ]
+        _features, result = classify(document, pages=4)
+        gate = news_gate(result)
+        self.assertNotEqual(gate["reason"], "path_newspaper_issue_masthead")
+        self.assertIn(
+            "requires one of issue_metadata/publication_date/publication_url",
+            gate["unsatisfied_paths"].get("newspaper_issue_masthead", []),
+        )
 
 
 class SubtypeTaxonomyTests(unittest.TestCase):
