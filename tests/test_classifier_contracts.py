@@ -86,8 +86,8 @@ def features_for(document):
 
 
 class VersionContractTests(unittest.TestCase):
-    def test_v10_identity(self):
-        self.assertTrue(CLASSIFIER_VERSION.startswith("rules-rvl-cdip-v10+"))
+    def test_v11_identity(self):
+        self.assertTrue(CLASSIFIER_VERSION.startswith("rules-rvl-cdip-v11+"))
         self.assertTrue(CLASSIFIER_VERSION.endswith(RULE_FINGERPRINT))
 
     def test_contract_versions(self):

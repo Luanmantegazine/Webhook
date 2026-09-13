@@ -133,7 +133,7 @@ Example result:
   "schema_version": "2.1",
   "taxonomy_version": "rvl-cdip-2.0",
   "feature_extraction_version": "2.6",
-  "classifier_version": "rules-rvl-cdip-v10+<rule_fingerprint>",
+  "classifier_version": "rules-rvl-cdip-v11+<rule_fingerprint>",
   "rule_fingerprint": "<12 hex>",
   "feature_fingerprint": "ff-<12 hex>",
   "classifier": "rules",
@@ -219,7 +219,7 @@ distinction.
 | `form_structured` | **A** questionnaire heading + 1 structural signal · **B** checkboxes + 1 structural signal · **C** form heading + 2 structural signals | `field_labels`, `label_value_lines`, `tab_stop_alignment`, `field_geometry_regularity`, `short_field_regions`, `blank_fields` | invoices, specifications, news, advertisements, budgets, resumes |
 | `correspondence` | two independent signals among header block, e-mail markers, salutation, closing, memo heading, letter geometry, letter body | — | forms, news reporting |
 | `research_paper` | two of: academic structure, citations, editorial metadata, academic layout | `academic_vocabulary` | news reporting, invoices, forms |
-| `news_article` | **A** byline + reporting · **B** wire service + dateline + reporting · **C** masthead + issue metadata + editorial structure + layout + reporting · **D** running header + editorial structure + layout + reporting | `attribution_quotes`, `multilingual_reporting`, `justified_body`, `multi_column_body`, `multi_column_publication`, `newspaper_column_geometry` | scientific publications, advertisements, forms, institutional correspondence, press releases |
+| `news_article` | **A** byline + reporting · **B** wire service + dateline + reporting · **C** masthead + publication identity + editorial structure + layout + reporting (including `issue_reporting_language`) · **D** running header + editorial structure + layout + reporting | `attribution_quotes`, `multilingual_reporting`, `justified_body`, `multi_column_body`, `multi_column_publication`, `newspaper_column_geometry` | scientific publications, advertisements, forms, institutional correspondence, press releases |
 | `presentation_marketing` | **A** deck vocabulary (`presentation_terms`) **and** one visual/structural corroboration · **B** a call **and** an identified event **and** one organisation signal **and** one page shape | `visual_layout`, `landscape_layout`, `visual_dominance`, `sparse_centered`, `slide_structure`, `event_logistics`, `event_organization`, `submission_instructions`, `event_announcement_layout`, `marketing_copy` | near-empty OCR, low-confidence OCR, forms, invoices; path **B** additionally: news reporting, reported speech |
 
 Consequences worth stating explicitly, because each was a measured failure:
@@ -362,6 +362,57 @@ to reproduce the reported detector behaviour:
 | --- | --- | --- | --- | --- | --- |
 | regions only (v8) | 0 | 1 | 0 | 1 | `other` / fallback, 0.3061 |
 | with `page_words` (v9) | 2 | 1 | 1 | 1 | `news_article` / `newspaper_issue`, 1.3529 |
+
+### When the byline is unreadable rather than absent (v11)
+
+A complete New York Times front page came back as `other` by fallback. The
+page was measured correctly — a nameplate, a domain, eight headlines, eight
+article clusters, a six-column grid, 808 words, `news_article` scoring 1.0588
+before the gate — and the gate refused it on one clause: the reporting
+alternatives it accepted were a byline, a wire credit, quoted attribution or
+four reporting verbs, and the scan had none of them.
+
+That is what dense newsprint does to OCR. The small-caps `BY` above a name is
+read into the name or dropped, names fragment, the edition line and the date
+corrupt, and the quotation marks `attribution_quotes` counts come back as
+apostrophes. The markers were not absent from the page; they were absent from
+the reading of it. What survived was the body: `reporting_verb_count = 2` in
+808 words.
+
+`news_article.issue_reporting_language` is that surviving evidence — two
+reporting verbs in a page-length body — and it is weak on purpose:
+
+| | |
+| --- | --- |
+| Predicate | `reporting_verb_count >= 2` and `max(word_count, word_token_count) >= 500` |
+| Group | `reporting_evidence`, with `attribution_quotes`, `multilingual_reporting` and `justified_body` |
+| Weight | 0.16, equal to the rest of the group |
+| Admitted by | `newspaper_issue_masthead` only |
+
+Two consequences follow from the group, not from the weight. Only the
+strongest fired member of a substitutable group contributes, so a document
+that fires both this rule and `multilingual_reporting` scores exactly what it
+scored before; and because 0.16 is already the group's capacity,
+`decision_mass` (0.68) and `available_mass` (1.6) for the family are unchanged,
+so no document that already classified moves.
+
+`multilingual_reporting` keeps its four-verb floor: it is used by paths that
+have less around them. The single-article paths and
+`newspaper_issue_running_header` do not admit the new rule at all — with no
+nameplate the reporting language is doing more of the work there.
+
+**The safety argument, and where it ends.** The relaxation applies only where
+five independent clauses are already satisfied: a nameplate, an identifying
+line, several headlines, several article clusters and a newspaper column grid.
+That is what makes it defensible for a scanned issue — and it is also
+satisfied by a product catalogue with a large nameplate, a domain and a column
+grid, which needs only two reporting verbs in its copy to open the path.
+`GateIsolationTests.test_known_cost_a_catalogue_that_quotes_its_own_managers`
+records that case as an expected failure rather than leaving it undiscovered:
+it asserts the behaviour we want, fails today, and will report an unexpected
+success the moment a guard closes it. Closing it needs a discriminator this
+change does not have — narrative column geometry, or a path split — and both
+are more than a minimal change.
 
 ### The masthead is typographic; identity is separate
 
@@ -962,6 +1013,19 @@ newspaper carrying a conference advertisement, and an invoice with a
 registration due date. The near misses are non-vacuous: each fires
 `event_identity`, and the newspaper meets every requirement of the path and is
 stopped by `reported_speech_evidence`.
+
+`tests/test_issue_reporting_language.py` covers v11: the real front page as a
+recorded feature record (`tests/fixtures/nyt_front_page_features.json`, whose
+`provenance` block says which keys the production run reported, which were
+declared to make the record loadable, and why the page text is not carried),
+the rule's numeric boundaries (1 verb / 800 words, 2 / 499, 2 / 500, the
+`word_token_count` reading, the four-verb floor `multilingual_reporting`
+keeps, and both readings scoring as one group contribution), the path
+restriction read off `FAMILY_GATES`, and the documents the widened clause must
+still refuse — a long reporting text with no nameplate, a technical report, a
+catalogue, a press release, an event announcement, and an academic article
+whose "reported" and "according to" fire the new rule while the gate blocks it
+on `research_publication_evidence`.
 
 `tests/test_family_gates.py` covers the v6 gates. Each test encodes a failure
 the development run actually produced: visual-only evidence refused with

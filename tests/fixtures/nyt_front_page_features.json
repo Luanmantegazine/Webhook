@@ -1,0 +1,62 @@
+{
+  "provenance": {
+    "document": "Complete front page of The New York Times, scanned.",
+    "source": "Feature record reported by the production workflow (YOLO DocLayNet regions + docTR OCR), not re-extracted in this repository.",
+    "observed_with": "rules-rvl-cdip-v9+8a9991b39a34",
+    "observed_result": {
+      "document_family": "other",
+      "decision": "fallback",
+      "reason": "no_rules_matched",
+      "pre_gate_scores.news_article": 1.0588
+    },
+    "reported_keys": [
+      "publication_masthead_count",
+      "publication_url_count",
+      "headline_count",
+      "article_cluster_count",
+      "max_narrative_column_count",
+      "multi_column_page_ratio",
+      "newspaper_column_geometry_ratio",
+      "word_count",
+      "reporting_verb_count",
+      "byline_count",
+      "wire_service_count",
+      "quotation_attribution_count",
+      "publication_date_count",
+      "issue_metadata_count"
+    ],
+    "declared_keys": {
+      "total_pages": "1 — a single front page; needed for the multipage channel.",
+      "measured_page_ratio": "1.0 — the layout channel produced the reported region measurements.",
+      "geometry_page_ratio": "1.0 — the geometry channel produced newspaper_column_geometry_ratio.",
+      "alnum_character_count": "4040 — derived as 808 words x 5 characters. Its only consumer is the 20-character abstention floor, so any value above 20 behaves identically."
+    },
+    "absent_keys": "Every other feature is absent and therefore reads as 0 or unavailable. That can only withhold evidence, never add it. classification_text is deliberately not stored: the production record reported counts, and the page's text is not this repository's to carry.",
+    "reproduces": {
+      "byline_count": 0,
+      "publication_date_count": 0,
+      "issue_metadata_count": 0,
+      "reporting_verb_count": 2
+    }
+  },
+  "features": {
+    "publication_masthead_count": 1,
+    "publication_url_count": 1,
+    "headline_count": 8,
+    "article_cluster_count": 8,
+    "max_narrative_column_count": 6,
+    "multi_column_page_ratio": 1.0,
+    "newspaper_column_geometry_ratio": 1.0,
+    "word_count": 808,
+    "reporting_verb_count": 2,
+    "byline_count": 0,
+    "wire_service_count": 0,
+    "quotation_attribution_count": 0,
+    "publication_date_count": 0,
+    "issue_metadata_count": 0,
+    "total_pages": 1,
+    "measured_page_ratio": 1.0,
+    "geometry_page_ratio": 1.0,
+    "alnum_character_count": 4040
+  }
+}

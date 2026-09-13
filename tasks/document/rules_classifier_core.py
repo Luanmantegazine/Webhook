@@ -2130,6 +2130,30 @@ RULES: tuple[RuleSpec, ...] = (
         and max(c.num("word_count"), c.num("word_token_count")) >= 250,
         group="reporting_evidence",
     ),
+    # v11. Narrative language at the length of an *issue*, for the one case
+    # where the stronger journalistic markers are unreadable rather than
+    # absent. Dense newsprint is where OCR fails hardest: "BY" is set in small
+    # caps above the name and is read as part of it or dropped, names fragment,
+    # the edition line and the date are corrupted, and the quotation marks that
+    # ``attribution_quotes`` counts come back as apostrophes or nothing. What
+    # survives is the body: reporting verbs in a page-length text.
+    #
+    # Two verbs and 500 words is deliberately weak evidence, which is why this
+    # rule is admitted by exactly one path — ``newspaper_issue_masthead`` —
+    # where a nameplate, an identifying line, several headlines, several
+    # article clusters and a newspaper column grid have *already* been
+    # established independently. It is not admitted anywhere a document could
+    # become news on reporting language alone.
+    _rule(
+        "news_article",
+        "issue_reporting_language",
+        lambda c: c.num("reporting_verb_count") >= 2
+        # The longer of the two readings of the page, as in
+        # ``multilingual_reporting``: the region stream can hold a fraction of
+        # the words the OCR actually read.
+        and max(c.num("word_count"), c.num("word_token_count")) >= 500,
+        group="reporting_evidence",
+    ),
     _rule(
         "news_article",
         "justified_body",
@@ -2334,6 +2358,13 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     # readings of "this document reports" — and the group capacity, and with it
     # the family's decision mass, is unchanged.
     "news_article.multilingual_reporting": 0.16,
+    # Equal to the rest of ``reporting_evidence`` for the same reason: within a
+    # substitutable group only the strongest fired member counts, so an unequal
+    # weight would make the group capacity depend on which reading fired. At
+    # 0.16 the group capacity is unchanged, and with it ``decision_mass``,
+    # ``available_mass`` and the score of every document that already
+    # classified.
+    "news_article.issue_reporting_language": 0.16,
     "news_article.justified_body": 0.16,
     "news_article.publication_masthead": 0.20,
     "news_article.repeated_publication_header": 0.18,
@@ -2953,6 +2984,10 @@ FAMILY_GATES: tuple[FamilyGate, ...] = (
                         "wire_service",
                         "attribution_quotes",
                         "multilingual_reporting",
+                        # v11, and only here: the weakest reading of "this
+                        # publication reports" is admitted once the other five
+                        # clauses of this path have already been met.
+                        "issue_reporting_language",
                     ),
                 ),
                 blockers=_NEWSPAPER_ISSUE_BLOCKERS,
@@ -3007,6 +3042,7 @@ FAMILY_GATES: tuple[FamilyGate, ...] = (
         corroborating=(
             "attribution_quotes",
             "multilingual_reporting",
+            "issue_reporting_language",
             "justified_body",
             "multi_column_body",
             "multi_column_publication",
@@ -3037,6 +3073,20 @@ FAMILY_GATES: tuple[FamilyGate, ...] = (
             "document-wide guards; the newspaper paths do not, because an issue "
             "contains advertisements, letters, coupons and reference lists without "
             "being any of them."
+            "\n\n"
+            "v11 widens the reporting clause of ``newspaper_issue_masthead`` "
+            "alone, with ``issue_reporting_language``: two reporting verbs in a "
+            "page-length body. Dense newsprint is where OCR fails hardest — the "
+            "small-caps ``BY`` is read into the name or lost, names fragment, the "
+            "edition line and the date corrupt, and quotation marks come back as "
+            "apostrophes — so the strongest journalistic markers can be "
+            "unreadable rather than absent. The evidence is deliberately weak, "
+            "which is why it is admitted only where five independent clauses are "
+            "already satisfied: a nameplate, an identifying line, several "
+            "headlines, several article clusters and a newspaper column grid. "
+            "``newspaper_issue_running_header`` keeps the narrower clause, "
+            "because with no nameplate the reporting language is doing more of "
+            "the work, and neither single-article path admits it at all."
         ),
         path_subtypes=(
             ("byline_with_reporting", "single_news_article"),
@@ -3648,6 +3698,13 @@ def _rule_fingerprint() -> str:
 #: rule, a weight, a gate, a blocker or a family threshold moves it.
 RULE_FINGERPRINT = _rule_fingerprint()
 
+#: v11: ``news_article.issue_reporting_language`` — two reporting verbs in a
+#: page-length body — is admitted as the weakest reading of "this publication
+#: reports", in the ``newspaper_issue_masthead`` path only, where five
+#: independent clauses are already satisfied. It exists for the scanned
+#: broadsheet whose byline, dateline and quotation marks the OCR destroyed. No
+#: feature changed and no threshold moved.
+#:
 #: v10: ``presentation_marketing`` learns the institutional event announcement —
 #: a call for papers, a congress programme, a workshop flyer — as a second gate
 #: path built from four independent observations (a call, an identified event,
@@ -3668,7 +3725,7 @@ RULE_FINGERPRINT = _rule_fingerprint()
 #: newspaper structure and column features; and financial guards that stop a
 #: dialling code, a run of month names or a page of advertised prices from
 #: reading as accounting evidence.
-CLASSIFIER_VERSION = f"rules-rvl-cdip-v10+{RULE_FINGERPRINT}"
+CLASSIFIER_VERSION = f"rules-rvl-cdip-v11+{RULE_FINGERPRINT}"
 
 
 def available_channels(features: dict) -> frozenset[str]:
