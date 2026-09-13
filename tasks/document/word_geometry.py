@@ -449,6 +449,143 @@ def _page_geometry(words: list[Word], page_size: tuple[float, float]) -> dict | 
     }
 
 
+class PageLine(NamedTuple):
+    """One reconstructed OCR line, with everything a lexical rule needs.
+
+    Case and punctuation are preserved verbatim — a byline is recognised by
+    ``BY`` in capitals and a dateline by its comma, so a lower-cased or
+    stripped reconstruction would destroy the very signal it is built to find.
+    """
+
+    text: str
+    page_index: int
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+    page_width: float
+    page_height: float
+
+    @property
+    def width(self) -> float:
+        return self.x1 - self.x0
+
+    @property
+    def height(self) -> float:
+        return self.y1 - self.y0
+
+
+def _page_size_of(page_sizes: Any, page_index: int) -> tuple[float, float] | None:
+    sizes = page_sizes if isinstance(page_sizes, (list, tuple)) else []
+    if page_index >= len(sizes):
+        return None
+    candidate = sizes[page_index]
+    if not isinstance(candidate, (list, tuple)) or len(candidate) != 2:
+        return None
+    try:
+        width, height = float(candidate[0]), float(candidate[1])
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(width) and math.isfinite(height)) or width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
+def reconstruct_page_lines(
+    page_words: Any, page_sizes: Any, page_count: int
+) -> list[PageLine]:
+    """Rebuild readable lines of text from the word boxes, page by page.
+
+    ``page_words`` was feeding the geometry features only, so everything the
+    OCR read but the layout detector did not enclose in a region was invisible
+    to every lexical rule. On a scanned broadsheet that is most of the editorial
+    furniture: the nameplate, the dateline, the edition line and the bylines sit
+    in bands the region detector types as something else or misses entirely.
+
+    This is the *same* parser the geometry features use — the words are read by
+    :func:`parse_page_words` and grouped by :func:`group_lines` — so the two
+    views of the page cannot drift apart, which a second, independent word
+    reader would guarantee they eventually did.
+    """
+    try:
+        total_pages = max(0, int(page_count))
+    except (TypeError, ValueError, OverflowError):
+        return []
+
+    lines: list[PageLine] = []
+    for page_index in range(total_pages):
+        size = _page_size_of(page_sizes, page_index)
+        words = parse_page_words(page_words, page_index, size)
+        if not words:
+            continue
+        if size is None:
+            size = (
+                max(word.x1 for word in words) * 1.06,
+                max(word.y1 for word in words) * 1.06,
+            )
+        width, height = size
+        for line in group_lines(words):
+            text = " ".join(word.text for word in line if word.text).strip()
+            if not text:
+                continue
+            lines.append(
+                PageLine(
+                    text=text,
+                    page_index=page_index,
+                    x0=min(word.x0 for word in line),
+                    y0=min(word.y0 for word in line),
+                    x1=max(word.x1 for word in line),
+                    y1=max(word.y1 for word in line),
+                    page_width=width,
+                    page_height=height,
+                )
+            )
+    return lines
+
+
+#: A nameplate is set several times the size of body type, spans a good part of
+#: the measure, and sits at the top of the page. These are the three properties
+#: that hold for every newspaper nameplate and for almost nothing else.
+MASTHEAD_MIN_HEIGHT_RATIO = 2.2
+MASTHEAD_MIN_WIDTH_FRACTION = 0.25
+MASTHEAD_TOP_BAND = 0.25
+
+
+def find_masthead_candidates(lines: list[PageLine]) -> list[PageLine]:
+    """Typographic nameplate candidates: size and position, never wording.
+
+    Deliberately blind to what the line *says*. A blackletter nameplate read as
+    "Che New Hork Cimes" is the same typographic object as a correct reading,
+    and a detector that required the name to be recognised would fail on
+    exactly the mastheads that are hardest to read — which are the ones set in
+    display faces, which is to say the ones most likely to be mastheads.
+
+    It is equally blind to the region class: the layout detector is free to call
+    the nameplate a ``Picture``, a ``Text`` block or nothing at all.
+    """
+    if not lines:
+        return []
+    body_heights = [line.height for line in lines if line.height > 0]
+    if not body_heights:
+        return []
+    median_height = statistics.median(body_heights)
+    if median_height <= 0:
+        return []
+
+    candidates = []
+    for line in lines:
+        if line.page_height <= 0 or line.page_width <= 0:
+            continue
+        if line.y0 > MASTHEAD_TOP_BAND * line.page_height:
+            continue
+        if line.height < MASTHEAD_MIN_HEIGHT_RATIO * median_height:
+            continue
+        if line.width < MASTHEAD_MIN_WIDTH_FRACTION * line.page_width:
+            continue
+        candidates.append(line)
+    return candidates
+
+
 def extract_geometry_features(
     page_words: Any,
     page_sizes: Any,

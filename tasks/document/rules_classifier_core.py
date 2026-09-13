@@ -36,6 +36,23 @@ replaced or calibrated on its own:
    operating point (:data:`FAMILY_CONFIDENCE_THRESHOLDS`), resolved as an offset
    from the global threshold so a sweep keeps describing the policy that runs.
 
+The score contract
+------------------
+``score`` and every value in ``candidate_scores`` are **unclipped evidence
+ratios**: ``fired_weight / decision_mass``, where 1.0 means "as much evidence as
+the family's strongest groups can supply". They **may exceed 1** when a document
+carries more than a sufficient case, and ranking, the threshold test and the
+margin all operate on those unclipped values. That is deliberate: clipping first
+lets two well-evidenced families meet at the ceiling, produce a zero margin and
+abstain at full confidence, which is the ambiguity the margin exists to detect.
+
+``confidence`` is the reporting value, and is the score clipped to ``[0, 1]``.
+
+Neither is a probability. The evaluator consumes ``score`` and
+``candidate_scores`` under this contract — it re-ranks stored candidate scores
+when replaying the decision policy — so the semantics must not be changed
+without changing the evaluator with it.
+
 Reproducibility
 ---------------
 Every result carries the identity of what produced it: ``schema_version``,
@@ -69,7 +86,11 @@ from tasks.document.rvl_cdip_eval import (
     TAXONOMY_VERSION,
     taxonomy_descriptor,
 )
-from tasks.document.word_geometry import extract_geometry_features
+from tasks.document.word_geometry import (
+    extract_geometry_features,
+    find_masthead_candidates,
+    reconstruct_page_lines,
+)
 
 #: External contract version of the feature record and of the classification
 #: result. It changes only when a *consumer* would have to change: adding a
@@ -92,7 +113,13 @@ SUPPORTED_FEATURE_SCHEMA_VERSIONS = frozenset({SCHEMA_VERSION})
 # reads a dialling code as a negative balance. The redefinition is why this is
 # a version bump and not an additive change: the same key now means something
 # different, so 2.3 and 2.4 records must not be pooled.
-FEATURE_EXTRACTION_VERSION = "2.4"
+# 2.5: editorial signals recovered from ``page_words`` as well as from regions
+# (byline, dateline, wire service, reporting verbs, quoted attribution, issue
+# metadata, publication date and URL), combined with ``max`` and never summed;
+# and ``publication_masthead_count`` redefined as a purely *typographic*
+# candidate count, with publication identity counted separately. Both are
+# redefinitions, so 2.4 records must not be pooled with 2.5 either.
+FEATURE_EXTRACTION_VERSION = "2.5"
 
 #: Provisional operating point, and the single source of truth for it. The task
 #: wrapper and the offline evaluator import these instead of restating them:
@@ -280,24 +307,41 @@ _YEAR_RANGE_RE = re.compile(
 # Portuguese forms — the v7 rule only recognised ``By First Last``, so a
 # Brazilian newspaper had no byline at all as far as the classifier was
 # concerned, which is a property of the pattern and not of the document.
+#: A capitalised name token that is *not* a conjunction. Without the guard the
+#: greedy name group swallowed the "AND" of "BY JONATHAN MARTIN AND ALEXANDER
+#: BURNS" as though it were a forename, matched up to "ALEXANDER", and left the
+#: surname outside the match — a partial match that looks like a byline and
+#: mis-reads the author list.
+_NAME_TOKEN = r"(?![Aa][Nn][Dd]\b)(?![Ee]\b)[A-ZÀ-Ý][\wÀ-ÿ.'’-]+"
+#: Separator between authors: a comma, "and", Portuguese "e", or an ampersand.
+_AUTHOR_SEPARATOR = r"\s*(?:,|\s(?:[Aa][Nn][Dd]|[Ee]|&))\s*"
+
 _BYLINE_RE = re.compile(
     # ``BY``/``POR`` in full capitals is the ordinary newspaper setting for a
     # byline, so the case of the introducer is not discriminating; the case of
     # the *name* after it still is.
-    r"^[ \t]*(?:[Bb][Yy]|[Pp][Oo][Rr])\s+"
+    rf"^[ \t]*(?:[Bb][Yy]|[Pp][Oo][Rr])\s+"
     # An optional role or title before the name: "Por Jornalista João Silva".
-    r"(?:[A-ZÀ-Ý][\wÀ-ÿ.'’-]+\s+){0,2}"
-    r"[A-ZÀ-Ý][\wÀ-ÿ.'’-]+\s+[A-ZÀ-Ý][\wÀ-ÿ.'’-]+"
+    rf"(?:{_NAME_TOKEN}\s+){{0,2}}{_NAME_TOKEN}\s+{_NAME_TOKEN}"
+    # Further authors, each a full name rather than a single token, so a joint
+    # byline is matched whole instead of being cut after the first surname.
+    rf"(?:{_AUTHOR_SEPARATOR}(?:{_NAME_TOKEN}\s+){{1,2}}{_NAME_TOKEN})*"
     r"|^[ \t]*[Dd](?:a|e)\s+[Rr]eda[cç][aã]o\b"
-    r"|^[ \t]*[Rr]eportagem\s+d[eo]\s+[A-ZÀ-Ý]"
-    r"|^[ \t]*[Tt]exto\s+d[eo]\s+[A-ZÀ-Ý]",
+    rf"|^[ \t]*[Rr]eportagem\s+d[eo]\s+{_NAME_TOKEN}(?:\s+{_NAME_TOKEN})?"
+    rf"|^[ \t]*[Tt]exto\s+d[eo]\s+{_NAME_TOKEN}(?:\s+{_NAME_TOKEN})?",
     re.MULTILINE,
 )
+
 _WIRE_SERVICE_RE = re.compile(
     r"\b(?:associated press|reuters|united press international|\(ap\)|\(upi\)|"
-    r"staff (?:writer|reporter)|special to the|wire services?)\b",
+    r"staff (?:writer|reporter)|special to the|wire services?|"
+    # Portuguese wire services, for symmetry with the other lexicons. A bare
+    # "redação" is deliberately absent: it is the newsroom, not an agency, and
+    # it already reads as a byline in "Da redação".
+    r"ag[êe]ncia (?:brasil|estado|globo|efe|lusa)|folhapress)\b",
     re.IGNORECASE,
 )
+
 # ``SÃO PAULO, 24 de janeiro de 2026`` alongside ``WASHINGTON, Apr. 4``.
 _DATELINE_RE = re.compile(
     r"^[ \t]*[A-ZÀ-Ý][A-ZÀ-Ý .\-]{2,25},\s*"
@@ -329,17 +373,21 @@ _QUOTE_ATTRIBUTION_RE = re.compile(
 # ---- publication identity -------------------------------------------------
 #: ``Ano XXXI``, ``Edição 717``, ``Número 42``, ``Nº 42``, ``Vol. 12``, ``No. 8``.
 #: A price is deliberately absent: it is corroboration, never identity.
+#: An issue number as newspapers actually print it: grouped with a thousands
+#: separator ("42,812", "1.717") *or* plain ("42812"). Named once and reused by
+#: every metadata pattern below, because the alternative — repeating the digit
+#: syntax in six places — is how "Issue Number No. 42,812" came to parse while
+#: "Issue 42812" did not.
+_ISSUE_NUMBER = r"\d{1,3}(?:[.,]\d{3})+|\d{1,6}"
+
 _ISSUE_METADATA_RE = re.compile(
-    # ``\d{1,3}(?:[.,]\d{3})*`` rather than ``\d{1,5}``: a daily prints its
-    # issue number with a thousands separator once it passes ten thousand, and
-    # "No. 42,812" is the ordinary form, not an exception.
-    r"\b(?:ano\s+(?:[IVXLC]{1,7}|\d{1,4})"
-    r"|edi[cç][aã]o\s+n?[ºo°]?\.?\s*\d{1,3}(?:[.,]\d{3})*"
-    r"|n[ºo°]\.?\s*\d{1,3}(?:[.,]\d{3})*"
-    r"|n[uú]mero\s+n?[ºo°]?\.?\s*\d{1,3}(?:[.,]\d{3})*"
-    r"|year\s+(?:[IVXLC]{1,7}|\d{1,4})"
-    r"|(?:issue|edition)\s+(?:number\s+)?n?[o°]?\.?\s*\d{1,3}(?:[.,]\d{3})*"
-    r"|vol(?:ume)?\.?\s*(?:[IVXLC]{1,7}|\d{1,4}))\b",
+    rf"\b(?:ano\s+(?:[IVXLC]{{1,7}}|\d{{1,4}})"
+    rf"|edi[cç][aã]o\s+n?[ºo°]?\.?\s*(?:{_ISSUE_NUMBER})"
+    rf"|n[ºo°]\.?\s*(?:{_ISSUE_NUMBER})"
+    rf"|n[uú]mero\s+n?[ºo°]?\.?\s*(?:{_ISSUE_NUMBER})"
+    rf"|year\s+(?:[IVXLC]{{1,7}}|\d{{1,4}})"
+    rf"|(?:issue|edition)\s+(?:number\s+)?n?[o°]?\.?\s*(?:{_ISSUE_NUMBER})"
+    rf"|vol(?:ume)?\.?\s*(?:[IVXLC]{{1,7}}|\d{{1,4}}))\b",
     re.IGNORECASE,
 )
 _PUBLICATION_DATE_RE = re.compile(
@@ -608,6 +656,7 @@ def classifier_versions() -> dict[str, Any]:
         "global_min_score_margin": DEFAULT_MIN_SCORE_MARGIN,
         "global_min_recognized_characters": DEFAULT_MIN_RECOGNIZED_CHARACTERS,
         "routing_release_status": dict(ROUTING_RELEASE_STATUS),
+        "routing_release_notes": dict(ROUTING_RELEASE_NOTES),
         "families_not_released_for_automatic_routing": sorted(
             FAMILIES_NOT_RELEASED_FOR_ROUTING
         ),
@@ -912,26 +961,23 @@ def _top_band_signature(regions: list[dict], page_height: float) -> str:
 
 
 def _detect_masthead(regions: list[dict], page_width: float, page_height: float) -> bool:
-    """A short, visually dominant title in the top band, with editorial metadata.
+    """A short, visually dominant title in the top band.
 
-    Every clause carries its weight: the title must be *short* (a nameplate, not
-    a headline), *dominant* (set far larger than body text), in the *top band*,
-    and accompanied by something that identifies the publication — a domain, an
-    issue number, a publication date. A cover price is not in that list: a price
-    beside a title is a magazine cover, a flyer, or a menu just as often.
+    A *typographic* test, and only that: short (a nameplate, not a headline),
+    dominant (set far larger than body text), in the top band. v8 also required
+    editorial metadata beside it, which conflated two independent observations
+    — "this looks like a nameplate" and "this publication identifies itself" —
+    so a nameplate whose edition line the OCR mangled stopped being a nameplate.
+    The gate now requires identity evidence as its own clause, which is both
+    stricter to read and easier to satisfy correctly.
     """
     if page_width <= 0 or page_height <= 0:
         return False
-    top_band_text = []
     candidate = False
     for region in regions:
         bbox = _valid_bbox(region.get("bbox"))
         if bbox is None:
             continue
-        if bbox[1] <= 0.35 * page_height:
-            text = _normalise_text(region.get("text"))
-            if text:
-                top_band_text.append(text)
         if region.get("class_name") not in HEADLINE_CLASSES:
             continue
         if bbox[1] > 0.22 * page_height:
@@ -950,14 +996,7 @@ def _detect_masthead(regions: list[dict], page_width: float, page_height: float)
                 continue
         candidate = True
 
-    if not candidate:
-        return False
-    banner = "\n".join(top_band_text)
-    return bool(
-        _ISSUE_METADATA_RE.search(banner)
-        or _PUBLICATION_DATE_RE.search(banner)
-        or _PUBLICATION_URL_RE.search(banner)
-    )
+    return candidate
 
 
 def _count_accounting_negatives(text: str, table_text: str) -> int:
@@ -1196,6 +1235,26 @@ def extract_classification_features(
     def area_ratio(value: float) -> float:
         return value / page_area_total if page_area_total > 0 else 0.0
 
+    # ---- the second text stream ------------------------------------------
+    # ``page_words`` fed the geometry features and nothing else, so everything
+    # the OCR read but the layout detector did not enclose in a region was
+    # invisible to every lexical rule. On a scanned broadsheet that is most of
+    # the editorial furniture: nameplate, dateline, edition line, bylines.
+    #
+    # The reconstructed text is deliberately **not** appended to
+    # ``classification_text``. Doing so would double ``word_count`` and every
+    # per-1000-word density built on it, and would double-count the vocabulary
+    # of every other family. It is used only to *recover* editorial signals the
+    # region stream missed, and each of those is combined with ``max`` rather
+    # than a sum, so a line read by both streams counts once.
+    page_line_records = reconstruct_page_lines(page_words, page_sizes, total_pages)
+    page_word_text = "\n".join(line.text for line in page_line_records)[:text_limit]
+    masthead_candidates = find_masthead_candidates(page_line_records)
+
+    def recovered(pattern: re.Pattern[str]) -> int:
+        """The stronger of the two readings, never their sum."""
+        return max(len(pattern.findall(text)), len(pattern.findall(page_word_text)))
+
     accounting_term_count = len(_ACCOUNTING_TERM_RE.findall(text))
     currency_matches = len(_CURRENCY_RE.findall(text))
 
@@ -1292,11 +1351,24 @@ def extract_classification_features(
         # A newspaper issue is a masthead, a column grid and several headlines
         # each with an article under it. None of that is observable in the
         # word bag these features used to be, so each part is measured.
-        "publication_masthead_count": masthead_pages,
-        "issue_metadata_count": len(_ISSUE_METADATA_RE.findall(text)),
-        "publication_date_count": len(_PUBLICATION_DATE_RE.findall(text)),
-        "publication_url_count": len(_PUBLICATION_URL_RE.findall(text)),
+        # ``publication_masthead_count`` is now the count of *typographic*
+        # candidates, from either stream. Whether the publication also
+        # identifies itself is a separate observation, counted below and
+        # required separately by the gate — v8 folded the two together, so a
+        # nameplate whose edition line the OCR mangled stopped being a
+        # nameplate at all.
+        "publication_masthead_count": max(masthead_pages, len(masthead_candidates)),
+        "masthead_region_count": masthead_pages,
+        "masthead_word_candidate_count": len(masthead_candidates),
+        "issue_metadata_count": recovered(_ISSUE_METADATA_RE),
+        "publication_date_count": recovered(_PUBLICATION_DATE_RE),
+        "publication_url_count": recovered(_PUBLICATION_URL_RE),
         "cover_price_count": len(_COVER_PRICE_RE.findall(text)),
+        # Journalistic signals, recovered from both streams.
+        "byline_count": recovered(_BYLINE_RE),
+        "dateline_count": recovered(_DATELINE_RE),
+        "wire_service_count": recovered(_WIRE_SERVICE_RE),
+        "page_word_line_count": len(page_line_records),
         "repeated_publication_header_ratio": round(repeated_header_ratio, 4),
         "headline_count": headline_count,
         "article_cluster_count": article_cluster_count,
@@ -1306,8 +1378,8 @@ def extract_classification_features(
             round(multi_column_pages / measured_pages, 4) if measured_pages else 0.0
         ),
         "newspaper_page_count": newspaper_pages,
-        "reporting_verb_count": len(_REPORTING_VERB_RE.findall(text)),
-        "quotation_attribution_count": len(_QUOTE_ATTRIBUTION_RE.findall(text)),
+        "reporting_verb_count": recovered(_REPORTING_VERB_RE),
+        "quotation_attribution_count": recovered(_QUOTE_ATTRIBUTION_RE),
     }
     extracted.update(
         extract_geometry_features(
@@ -1803,9 +1875,11 @@ RULES: tuple[RuleSpec, ...] = (
     # and advertisements. The public key stays ``news_article`` — workflows and
     # the RVL-CDIP mapping depend on it — and the two shapes are separated by
     # ``document_subtype`` instead.
-    _rule("news_article", "byline", lambda c: c.has(_BYLINE_RE)),
-    _rule("news_article", "dateline", lambda c: c.has(_DATELINE_RE)),
-    _rule("news_article", "wire_service", lambda c: c.has(_WIRE_SERVICE_RE)),
+    # These read the recovered counts rather than the region text alone: a
+    # byline the layout detector left outside every region is still a byline.
+    _rule("news_article", "byline", lambda c: c.num("byline_count") >= 1),
+    _rule("news_article", "dateline", lambda c: c.num("dateline_count") >= 1),
+    _rule("news_article", "wire_service", lambda c: c.num("wire_service_count") >= 1),
     # Reported speech: an attribution verb *attached to* a quotation, or enough
     # attribution in a body long enough for it to be narrative. One "disse" in
     # a caption decides nothing.
@@ -1822,7 +1896,10 @@ RULES: tuple[RuleSpec, ...] = (
     _rule(
         "news_article",
         "multilingual_reporting",
-        lambda c: c.num("reporting_verb_count") >= 4 and c.num("word_count") >= 250,
+        lambda c: c.num("reporting_verb_count") >= 4
+        # The longer of the two readings of the page: the region stream can
+        # hold a fraction of the words the OCR actually read.
+        and max(c.num("word_count"), c.num("word_token_count")) >= 250,
         group="reporting_evidence",
     ),
     _rule(
@@ -1851,11 +1928,27 @@ RULES: tuple[RuleSpec, ...] = (
         group="publication_identity",
         requires="layout",
     ),
+    # Publication identity, three substitutable readings of one observation:
+    # the publication says which issue it is, when it was published, or where
+    # it lives. v8 folded the date into the issue-number rule, which made a
+    # masthead with a URL and no issue number unidentifiable; the gate now
+    # asks for one of the three and the scorer counts the group once.
     _rule(
         "news_article",
         "issue_metadata",
-        lambda c: c.num("issue_metadata_count") >= 1
-        and (c.num("publication_date_count") >= 1 or c.num("issue_metadata_count") >= 2),
+        lambda c: c.num("issue_metadata_count") >= 1,
+        group="issue_metadata",
+    ),
+    _rule(
+        "news_article",
+        "publication_date",
+        lambda c: c.num("publication_date_count") >= 1,
+        group="issue_metadata",
+    ),
+    _rule(
+        "news_article",
+        "publication_url",
+        lambda c: c.num("publication_url_count") >= 1,
         group="issue_metadata",
     ),
     # ---- editorial structure ---------------------------------------------
@@ -1996,11 +2089,20 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     "news_article.dateline": 0.22,
     "news_article.wire_service": 0.20,
     "news_article.attribution_quotes": 0.16,
-    "news_article.multilingual_reporting": 0.14,
+    # 0.16, equal to the other members of ``reporting_evidence``. At 0.14 the
+    # declared path ``byline + multilingual_reporting`` scored 0.5882 against a
+    # 0.60 threshold: a combination the gate accepted and the scorer could not
+    # carry. Within a substitutable group only the strongest member counts, so
+    # equal weights are the coherent reading — the three are alternative
+    # readings of "this document reports" — and the group capacity, and with it
+    # the family's decision mass, is unchanged.
+    "news_article.multilingual_reporting": 0.16,
     "news_article.justified_body": 0.16,
     "news_article.publication_masthead": 0.20,
     "news_article.repeated_publication_header": 0.18,
     "news_article.issue_metadata": 0.18,
+    "news_article.publication_date": 0.16,
+    "news_article.publication_url": 0.14,
     "news_article.multiple_headlines": 0.16,
     "news_article.multiple_article_clusters": 0.18,
     "news_article.multi_column_body": 0.16,
@@ -2340,6 +2442,15 @@ _FORM_STRUCTURAL_SIGNALS: tuple[str, ...] = (
     "blank_fields",
 )
 
+#: The signals that count as *independent* evidence of correspondence.
+#:
+#: ``letter_body`` is deliberately absent. Its own rule documents it as
+#: corroborating and never standing alone — it only fires when a primary
+#: correspondence signal is already present — so counting it as one of two
+#: independent signals contradicts its definition. It also made the gate's
+#: weakest accepting combination ``closing + letter_body``, worth 0.325 against
+#: a 0.42 family threshold: a path the gate opened and the scorer could never
+#: carry. It still contributes to the score; it just cannot be half the case.
 _CORRESPONDENCE_SIGNALS: tuple[str, ...] = (
     "header_block",
     "email_markers",
@@ -2347,7 +2458,6 @@ _CORRESPONDENCE_SIGNALS: tuple[str, ...] = (
     "closing",
     "memo_heading",
     "letter_geometry",
-    "letter_body",
 )
 
 #: v7: deck vocabulary is the only independent reason to call a document a
@@ -2441,7 +2551,7 @@ FAMILY_GATES: tuple[FamilyGate, ...] = (
             ),
         ),
         primary=_CORRESPONDENCE_SIGNALS,
-        corroborating=(),
+        corroborating=("letter_body",),
         blockers=("form_evidence", "news_reporting_evidence"),
         blocker_reasons=(),
         reason_no_path="fewer_than_two_correspondence_signals",
@@ -2514,22 +2624,26 @@ FAMILY_GATES: tuple[FamilyGate, ...] = (
         # nothing: a magazine, a catalogue and a form all have columns, and a
         # price beside a title is a cover of some kind but not necessarily a
         # newspaper.
+        # Order matters: the first satisfied path names the subtype and the
+        # reason. The newspaper readings come first because they require
+        # strictly more evidence — a nameplate, four headlines, three article
+        # clusters, a column grid, identity and reporting — and a whole
+        # newspaper naturally also contains bylines. Reading such a document
+        # as a single clipped article would be the weaker of two true
+        # readings.
         paths=(
             GatePath(
-                name="byline_with_reporting",
-                all_of=("byline",),
-                any_of=(("attribution_quotes", "justified_body", "multilingual_reporting"),),
-            ),
-            GatePath(
-                name="wire_and_dateline_with_reporting",
-                all_of=("wire_service", "dateline"),
-                any_of=(("attribution_quotes", "justified_body", "multilingual_reporting"),),
-            ),
-            GatePath(
                 name="newspaper_issue_masthead",
+                # Six clauses, each an independent observation. v8 required the
+                # nameplate and the issue number as one conjunction inside the
+                # masthead detector, which meant a mangled edition line stopped
+                # the nameplate from counting at all. Identity is now its own
+                # clause, satisfiable by an issue number, a publication date or
+                # a domain, and a journalistic clause is required as well: a
+                # nameplate over columns of headings is a listings paper or a
+                # catalogue unless something on the page reports.
                 all_of=(
                     "publication_masthead",
-                    "issue_metadata",
                     "multiple_headlines",
                     "multiple_article_clusters",
                 ),
@@ -2539,16 +2653,18 @@ FAMILY_GATES: tuple[FamilyGate, ...] = (
                         "newspaper_column_geometry",
                         "multi_column_body",
                     ),
-                    # Reporting language, required in addition to identity,
-                    # structure and layout. A product catalogue satisfies all
-                    # three of those — a nameplate, an edition line, headings
-                    # over blurbs, a column grid — and is not journalism. What
-                    # separates a newspaper from any other multi-column
-                    # periodical is that it *reports*: quoted sources and
-                    # attribution verbs. ``justified_body`` is deliberately not
-                    # in this pool: justified type is a printing choice, not
-                    # evidence of reporting.
-                    ("attribution_quotes", "multilingual_reporting"),
+                    # Publication identity, independent of the nameplate.
+                    ("issue_metadata", "publication_date", "publication_url"),
+                    # Journalistic evidence. Wider than the running-header path
+                    # below: with a nameplate and an identifying line present, a
+                    # byline or a wire-service credit is evidence enough that
+                    # the publication reports.
+                    (
+                        "byline",
+                        "wire_service",
+                        "attribution_quotes",
+                        "multilingual_reporting",
+                    ),
                 ),
                 blockers=_NEWSPAPER_ISSUE_BLOCKERS,
             ),
@@ -2565,9 +2681,26 @@ FAMILY_GATES: tuple[FamilyGate, ...] = (
                         "newspaper_column_geometry",
                         "multi_column_body",
                     ),
+                    # Narrower than the masthead path on purpose: with no
+                    # nameplate and no identifying line, the running header is
+                    # the only identity evidence, so the reporting clause has to
+                    # be reporting *language* rather than a byline. Identity,
+                    # structure and layout alone are satisfied by a product
+                    # catalogue, and what makes a publication journalistic is
+                    # that it reports.
                     ("attribution_quotes", "multilingual_reporting"),
                 ),
                 blockers=_NEWSPAPER_ISSUE_BLOCKERS,
+            ),
+            GatePath(
+                name="byline_with_reporting",
+                all_of=("byline",),
+                any_of=(("attribution_quotes", "justified_body", "multilingual_reporting"),),
+            ),
+            GatePath(
+                name="wire_and_dateline_with_reporting",
+                all_of=("wire_service", "dateline"),
+                any_of=(("attribution_quotes", "justified_body", "multilingual_reporting"),),
             ),
         ),
         primary=(
@@ -2577,6 +2710,8 @@ FAMILY_GATES: tuple[FamilyGate, ...] = (
             "publication_masthead",
             "repeated_publication_header",
             "issue_metadata",
+            "publication_date",
+            "publication_url",
             "multiple_headlines",
             "multiple_article_clusters",
         ),
@@ -2622,7 +2757,13 @@ FAMILY_GATES: tuple[FamilyGate, ...] = (
         ),
         metric_keys=(
             "publication_masthead_count",
+            "masthead_region_count",
+            "masthead_word_candidate_count",
             "issue_metadata_count",
+            "publication_url_count",
+            "byline_count",
+            "dateline_count",
+            "wire_service_count",
             "publication_date_count",
             "repeated_publication_header_ratio",
             "headline_count",
@@ -2735,6 +2876,22 @@ ROUTING_RELEASE_STATUS: dict[str, str] = {
     **{family: "development_only" for family in SCORED_FAMILIES},
     "presentation_marketing": "not_released_for_automatic_routing",
     "financial_document": "not_released_for_automatic_routing",
+    # v9. The newspaper_issue paths have been exercised on fixtures and on one
+    # real scanned page, and measured on no development split at all: no
+    # RVL-CDIP sample is a whole newspaper issue, so the corpus cannot tell us
+    # what these paths cost. Withheld until a holdout says otherwise.
+    "news_article": "not_released_for_automatic_routing",
+}
+
+#: Why a family is withheld, recorded next to the fact that it is.
+ROUTING_RELEASE_NOTES: dict[str, str] = {
+    "presentation_marketing": "gate rebuilt in v7; precision unmeasured since",
+    "financial_document": "precision never examined on the development run",
+    "news_article": (
+        "newspaper_issue paths require holdout validation: the development split "
+        "contains no whole newspaper issues, so their precision and recall are "
+        "unmeasured"
+    ),
 }
 
 FAMILIES_NOT_RELEASED_FOR_ROUTING: frozenset[str] = frozenset(
@@ -2972,6 +3129,75 @@ def evaluate_family_gates(
     return report
 
 
+def minimal_satisfying_rules(gate: FamilyGate, path: GatePath) -> set[str]:
+    """The cheapest set of rules that satisfies one path.
+
+    Cheapest, not any: a path is reachable only if its *weakest* satisfying
+    combination clears the bar, because that is the combination a real document
+    will present. Choosing the strongest member of each pool would prove
+    nothing about the case that actually fails.
+    """
+    chosen = set(path.all_of)
+    weight_of = lambda name: float(DEFAULT_WEIGHTS.get(f"{gate.family}.{name}", 0.0))
+    for pool in path.any_of:
+        if not any(name in chosen for name in pool):
+            chosen.add(min(pool, key=weight_of))
+    for count, units in path.min_units:
+        satisfied = [unit for unit in units if any(name in chosen for name in unit)]
+        remaining = [unit for unit in units if unit not in satisfied]
+        remaining.sort(key=lambda unit: min(weight_of(name) for name in unit))
+        for unit in remaining[: max(0, count - len(satisfied))]:
+            chosen.add(min(unit, key=weight_of))
+    return chosen
+
+
+def check_gate_path_reachability(
+    confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+) -> list[dict]:
+    """Can each declared path reach the bar its family is judged against?
+
+    A gate that opens on a combination the scorer cannot carry to the threshold
+    is a path that exists on paper and never classifies anything: the document
+    passes the gate, scores below the bar, and is refused with a reason that
+    describes the score rather than the real cause. v8 shipped exactly that —
+    ``byline + multilingual_reporting`` satisfied its path and scored 0.5882
+    against 0.60 — so this is checked rather than assumed.
+
+    Returns one row per path with its minimal satisfying rule set, the score
+    that set produces, the threshold it is judged against, and whether it
+    clears. Channels are assumed available: an unreachable-on-paper path is a
+    declaration error, while a path unreachable for want of a channel is a
+    property of the document.
+    """
+    features = {
+        "measured_page_ratio": 1.0,
+        "geometry_page_ratio": 1.0,
+        "total_pages": 1,
+    }
+    thresholds = resolve_family_thresholds(confidence_threshold)
+    rows = []
+    for gate in FAMILY_GATES:
+        threshold = float(thresholds.get(gate.family, confidence_threshold))
+        for path in gate.paths:
+            chosen = minimal_satisfying_rules(gate, path)
+            indicators = {
+                rule_id: rule_id in {f"{gate.family}.{name}" for name in chosen}
+                for rule_id in RULE_IDS
+            }
+            score = score_families(features, indicators)[gate.family]["score"]
+            rows.append(
+                {
+                    "family": gate.family,
+                    "path": path.name,
+                    "minimal_rules": sorted(chosen),
+                    "score": score,
+                    "threshold": round(threshold, 6),
+                    "reachable": score >= threshold,
+                }
+            )
+    return rows
+
+
 def resolve_family_thresholds(
     confidence_threshold: float,
     overrides: dict[str, float] | None = None,
@@ -3073,7 +3299,9 @@ def _rule_fingerprint() -> str:
         parts.append(
             f"gate:{gate.family}|{gate.paths}|{gate.primary}|{gate.corroborating}|"
             f"{gate.blockers}|{gate.blocker_reasons}|{gate.reason_no_path}|"
-            f"{gate.reason_corroborating_only}"
+            # ``path_subtypes`` decides which subtype a result reports, so it is
+            # part of the classifier's identity like any other decision input.
+            f"{gate.reason_corroborating_only}|{gate.path_subtypes}"
         )
     for blocker in BLOCKERS:
         parts.append(f"blocker:{blocker.name}|{_definition_signature(blocker.predicate)}")
@@ -3098,13 +3326,18 @@ def _rule_fingerprint() -> str:
 #: rule, a weight, a gate, a blocker or a family threshold moves it.
 RULE_FINGERPRINT = _rule_fingerprint()
 
+#: v9: editorial signals recovered from ``page_words``, a typographic masthead
+#: candidate independent of the layout detector's classes, publication identity
+#: as its own gate clause, and every declared gate path checked for
+#: reachability against the threshold it is judged by.
+#:
 #: v8: ``news_article`` becomes a news *publication* family with two shapes —
 #: a whole newspaper issue and a single article — reported through
 #: ``document_subtype``; multilingual byline, dateline and reporting lexicons;
 #: newspaper structure and column features; and financial guards that stop a
 #: dialling code, a run of month names or a page of advertised prices from
 #: reading as accounting evidence.
-CLASSIFIER_VERSION = f"rules-rvl-cdip-v8+{RULE_FINGERPRINT}"
+CLASSIFIER_VERSION = f"rules-rvl-cdip-v9+{RULE_FINGERPRINT}"
 
 
 def available_channels(features: dict) -> frozenset[str]:
@@ -3543,6 +3776,7 @@ def classify_with_rules(
         # Reported so a caller cannot act on a family the benchmark has not
         # cleared without seeing that it has not been cleared.
         "routing_release_status": ROUTING_RELEASE_STATUS.get(selected, "not_a_scored_family"),
+        "routing_release_note": ROUTING_RELEASE_NOTES.get(selected, ""),
         "released_for_automatic_routing": False,
         "recommended_template": (
             FAMILY_TEMPLATES.get(selected) if mode == "auto" and decision["decision"] == "classified" else None

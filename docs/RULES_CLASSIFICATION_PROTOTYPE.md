@@ -61,7 +61,7 @@ label.
 | --- | --- |
 | `SCHEMA_VERSION` | The external contract of the feature record or the result changes. Adding a field does not move it. |
 | `TAXONOMY_VERSION` | The family set, the label mapping or the subtype vocabulary changes. Now **rvl-cdip-2.1**: subtypes exist. No label was remapped, so ground truth is unchanged. |
-| `FEATURE_EXTRACTION_VERSION` | Any derived feature's definition changes. Now **2.4**: v8 adds the newspaper-structure features and *redefines* `accounting_negative_count`, so a 2.3 cache is refused rather than pooled. |
+| `FEATURE_EXTRACTION_VERSION` | Any derived feature's definition changes. Now **2.5**: v9 recovers editorial signals from `page_words` and *redefines* `publication_masthead_count` as a typographic candidate count, so a 2.4 cache is refused rather than pooled. |
 | `feature_fingerprint` | The emitted feature key set or the extraction version changes. Recomputable from the record itself. |
 | `CLASSIFIER_VERSION` / `rule_fingerprint` | Any rule, weight, substitutable group, channel, gate, blocker, family threshold, decision-group count, **or global operating point** (threshold, minimum margin, minimum recognised characters) changes. |
 
@@ -132,8 +132,8 @@ Example result:
 {
   "schema_version": "2.1",
   "taxonomy_version": "rvl-cdip-2.0",
-  "feature_extraction_version": "2.4",
-  "classifier_version": "rules-rvl-cdip-v8+<rule_fingerprint>",
+  "feature_extraction_version": "2.5",
+  "classifier_version": "rules-rvl-cdip-v9+<rule_fingerprint>",
   "rule_fingerprint": "<12 hex>",
   "feature_fingerprint": "ff-<12 hex>",
   "classifier": "rules",
@@ -328,6 +328,113 @@ What makes a publication journalistic is that it reports. `tests/test_news_publi
 holds the catalogue as a regression case.
 
 Photographs, prices, short text and columns open nothing on their own.
+
+### Lexical recovery from `page_words` (v9)
+
+`page_words` fed the geometry features and nothing else, so everything the OCR
+read but the layout detector did not enclose in a region was invisible to every
+lexical rule. On a scanned broadsheet that is most of the editorial furniture:
+the nameplate, the dateline, the edition line, the bylines. A real front page
+with 8 headlines, 8 article clusters and 6 columns scored **0.5588** and was
+refused, with `publication_masthead_count`, `publication_date_count` and
+`issue_metadata_count` all zero.
+
+v9 reconstructs OCR lines per page from the word boxes, using the *same* parser
+the geometry features use (`parse_page_words` → `group_lines`), so the two views
+of a page cannot drift apart. Case, punctuation, page and vertical position are
+preserved — a byline is recognised by `BY` in capitals and a dateline by its
+comma.
+
+The reconstructed text is **not** appended to `classification_text`. Doing so
+would double `word_count`, every per-thousand-word density built on it, and the
+vocabulary counts of every other family. It is used only to recover editorial
+signals, and each is combined with `max(region_stream, page_word_stream)` —
+never a sum, so a line read by both streams counts once.
+
+Recovered: `byline_count`, `dateline_count`, `wire_service_count`,
+`reporting_verb_count`, `quotation_attribution_count`, `issue_metadata_count`,
+`publication_date_count`, `publication_url_count`.
+
+Measured on the real page, with the top editorial band removed from the regions
+to reproduce the reported detector behaviour:
+
+| | masthead | issue | date | url | result |
+| --- | --- | --- | --- | --- | --- |
+| regions only (v8) | 0 | 1 | 0 | 1 | `other` / fallback, 0.3061 |
+| with `page_words` (v9) | 2 | 1 | 1 | 1 | `news_article` / `newspaper_issue`, 1.3529 |
+
+### The masthead is typographic; identity is separate
+
+v8 required editorial metadata *inside* the masthead detector, so a nameplate
+whose edition line the OCR mangled stopped being a nameplate at all. The two are
+now separate observations:
+
+- **`publication_masthead`** is a purely typographic candidate — a line in the
+  top band, set at least 2.2× the median text height, spanning at least a
+  quarter of the measure. It is detected from `page_words` as well as from
+  regions, so it does not depend on the layout detector calling the nameplate a
+  `Title`, and it never reads the words: a blackletter nameplate OCR'd as
+  *"Che New Hork Cimes"* is the same typographic object as a correct reading,
+  and a detector that demanded the name be legible would fail on exactly the
+  mastheads most likely to be mastheads.
+- **Publication identity** is its own gate clause, satisfied by an issue
+  number, a publication date or a domain.
+
+### The `newspaper_issue_masthead` path
+
+Six clauses, each an independent observation:
+
+| Clause | Satisfied by |
+| --- | --- |
+| Nameplate | `publication_masthead` |
+| Editorial structure | `multiple_headlines` **and** `multiple_article_clusters` |
+| Layout | `multi_column_publication` / `newspaper_column_geometry` / `multi_column_body` |
+| Identity | `issue_metadata` / `publication_date` / `publication_url` |
+| Journalism | `byline` / `wire_service` / `attribution_quotes` / `multilingual_reporting` |
+
+`predominantly_advertising_evidence` remains the only blocker on the newspaper
+paths. The document-wide form, correspondence and incidental-advertising guards
+are **not** restored there — see the section above for why.
+
+The newspaper paths are declared **before** the single-article paths, because
+the first satisfied path names the subtype: a whole newspaper also contains
+bylines, and reading it as a single clipped article would be the weaker of two
+true readings.
+
+### Gate path reachability
+
+`check_gate_path_reachability()` computes, for every declared path, the
+*cheapest* rule set that satisfies it and the score that set produces. A gate
+that opens on a combination the scorer cannot carry to the threshold is a path
+that exists on paper and classifies nothing — the document passes the gate,
+scores below the bar, and is refused with a reason describing the score rather
+than the cause. v8 shipped exactly that: `byline + multilingual_reporting`
+satisfied its path and scored **0.5882** against 0.60.
+
+Two fixes, neither a data-fitted weight change:
+
+- `multilingual_reporting` 0.14 → **0.16**, equal to the other members of its
+  substitutable group. Only the strongest member of a group counts, so equal
+  weights are the coherent reading for three alternative readings of "this
+  document reports", and the group capacity — and the family's decision mass —
+  is unchanged.
+- `letter_body` is removed from `correspondence`'s independent-signal pool. Its
+  own rule documents it as corroborating and never standing alone, so counting
+  it as one of two *independent* signals contradicted its definition and made
+  the weakest accepting combination `closing + letter_body` at 0.325 against a
+  0.42 threshold. It still scores; it just cannot be half the case.
+
+Two paths remain unreachable, both pre-dating v9 and both recorded in
+`GatePathReachabilityTests.KNOWN_UNREACHABLE` so that a *new* one fails the test
+rather than joining a silent backlog:
+
+| Path | Weakest combination | Score | Threshold |
+| --- | --- | --- | --- |
+| `research_paper` / `two_independent_academic_groups` | `citations` + `two_column_layout` | 0.3188 | 0.43 |
+| `presentation_marketing` / `deck_vocabulary_with_visual_support` | `presentation_terms` + `sparse_centered` | 0.4839 | 0.60 |
+
+Both need a decision — a weight change or a threshold change — in a family this
+round was scoped away from, and neither is worth making without measurement.
 
 ### Blockers are per path, because an issue is a container
 
@@ -699,6 +806,7 @@ withheld in v7:
 | --- | --- |
 | `presentation_marketing` | Gate rebuilt for the second consecutive version; its precision has not been measured since. |
 | `financial_document` | Nothing in the development run examined its precision. |
+| `news_article` | The `newspaper_issue` paths require holdout validation: the development split contains no whole newspaper issues, so their precision and recall are unmeasured. |
 
 ## Classifier latency
 
