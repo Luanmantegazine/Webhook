@@ -60,8 +60,8 @@ label.
 | Identifier | Moves when |
 | --- | --- |
 | `SCHEMA_VERSION` | The external contract of the feature record or the result changes. Adding a field does not move it. |
-| `TAXONOMY_VERSION` | The family set or the label mapping changes. |
-| `FEATURE_EXTRACTION_VERSION` | Any derived feature's definition changes. |
+| `TAXONOMY_VERSION` | The family set, the label mapping or the subtype vocabulary changes. Now **rvl-cdip-2.1**: subtypes exist. No label was remapped, so ground truth is unchanged. |
+| `FEATURE_EXTRACTION_VERSION` | Any derived feature's definition changes. Now **2.4**: v8 adds the newspaper-structure features and *redefines* `accounting_negative_count`, so a 2.3 cache is refused rather than pooled. |
 | `feature_fingerprint` | The emitted feature key set or the extraction version changes. Recomputable from the record itself. |
 | `CLASSIFIER_VERSION` / `rule_fingerprint` | Any rule, weight, substitutable group, channel, gate, blocker, family threshold, decision-group count, **or global operating point** (threshold, minimum margin, minimum recognised characters) changes. |
 
@@ -132,14 +132,15 @@ Example result:
 {
   "schema_version": "2.1",
   "taxonomy_version": "rvl-cdip-2.0",
-  "feature_extraction_version": "2.3",
-  "classifier_version": "rules-rvl-cdip-v7+<rule_fingerprint>",
+  "feature_extraction_version": "2.4",
+  "classifier_version": "rules-rvl-cdip-v8+<rule_fingerprint>",
   "rule_fingerprint": "<12 hex>",
   "feature_fingerprint": "ff-<12 hex>",
   "classifier": "rules",
   "mode": "evaluate",
   "provenance": {},
   "document_family": "financial_document",
+  "document_subtype": null,
   "confidence": 0.9,
   "score": 0.9,
   "decision": "classified",
@@ -218,7 +219,7 @@ distinction.
 | `form_structured` | **A** questionnaire heading + 1 structural signal · **B** checkboxes + 1 structural signal · **C** form heading + 2 structural signals | `field_labels`, `label_value_lines`, `tab_stop_alignment`, `field_geometry_regularity`, `short_field_regions`, `blank_fields` | invoices, specifications, news, advertisements, budgets, resumes |
 | `correspondence` | two independent signals among header block, e-mail markers, salutation, closing, memo heading, letter geometry, letter body | — | forms, news reporting |
 | `research_paper` | two of: academic structure, citations, editorial metadata, academic layout | `academic_vocabulary` | news reporting, invoices, forms |
-| `news_article` | **A** byline + (attribution quotes or justified body) · **B** wire service + dateline + (attribution quotes or justified body) | `attribution_quotes`, `multi_column_body`, `justified_body` | scientific publications, advertisements, forms, institutional correspondence, press releases |
+| `news_article` | **A** byline + reporting · **B** wire service + dateline + reporting · **C** masthead + issue metadata + editorial structure + layout + reporting · **D** running header + editorial structure + layout + reporting | `attribution_quotes`, `multilingual_reporting`, `justified_body`, `multi_column_body`, `multi_column_publication`, `newspaper_column_geometry` | scientific publications, advertisements, forms, institutional correspondence, press releases |
 | `presentation_marketing` | deck vocabulary (`presentation_terms`) **and** one visual/structural corroboration | `visual_layout`, `landscape_layout`, `visual_dominance`, `sparse_centered`, `slide_structure`, `marketing_copy` | near-empty OCR, low-confidence OCR, forms, invoices |
 
 Consequences worth stating explicitly, because each was a measured failure:
@@ -277,6 +278,71 @@ measuring page orientation — and now measures the slide shape itself.
 `landscape_layout` also fired 0 times, but it measures what its name says and is
 kept for corpora that carry landscape pages; grouped with the other visual
 rules, it adds no decision mass.
+
+### The news publication family (v8)
+
+`news_article` is a **legacy public key**. It is the RVL-CDIP class name and the
+key every workflow reads, so it does not change. Conceptually the family is a
+*news publication*, and it covers two document shapes that a consumer may well
+want to treat differently:
+
+| Subtype | Shape |
+| --- | --- |
+| `single_news_article` | A clipped article: one headline, a byline, a body. |
+| `newspaper_issue` | A whole newspaper: a masthead, a column grid, many headlines with articles under them, photographs and advertisements. |
+
+The shape is reported as `document_subtype` on the result and in
+`evidence.family_gates.news_article`. The field is optional and additive —
+`null` for every family that declares no subtypes and for every refusal — which
+is why `SCHEMA_VERSION` does not move.
+
+An issue was unreachable under v7, and every reason was a property of the rules
+rather than of the document:
+
+| v7 behaviour | v8 |
+| --- | --- |
+| The byline pattern matched only `By First Last`. | `By`, `Por`, `Por <role> <name>`, `Da redação`, `Reportagem de …`. |
+| The dateline pattern was English-only. | `SÃO PAULO, 24 de janeiro de 2026` alongside `WASHINGTON, Apr. 4`. |
+| Attribution was `said` / `according to`. | A multilingual reporting lexicon, and `attribution_quotes` now requires a verb *attached to a quotation*. |
+| `two_column_ratio` answered a yes/no question about two columns. | Narrative columns are counted per page — two, three, four or more — from region left edges and, independently, from word geometry. |
+| A whole issue has no byline and no single dateline of its own. | The issue is recognised by what it *is*: publication identity, editorial structure and a column grid. |
+
+The newspaper paths require all of:
+
+1. **Publication identity** — a masthead with issue metadata, or a running
+   header repeated across pages. The masthead test is a short, visually
+   dominant title in the top band *plus* an identifying signal: a domain, an
+   issue number, a publication date. **A cover price is never one of them**: a
+   price beside a title is a magazine cover, a flyer or a menu just as often.
+2. **Editorial structure** — several headlines, each with an article under it.
+   A page of headings alone is a table of contents, so what is counted is the
+   headline *with a body beneath it in the same column*.
+3. **Newspaper layout** — a multi-column grid, by region geometry or by word
+   geometry.
+4. **Reporting language** — quoted sources or a density of attribution verbs.
+
+Point 4 is an addition to the specified formula, and it is there because
+identity, structure and layout alone are *also* satisfied by a product
+catalogue — a nameplate, an edition line, headings over blurbs, three columns.
+What makes a publication journalistic is that it reports. `tests/test_news_publication.py`
+holds the catalogue as a regression case.
+
+Photographs, prices, short text and columns open nothing on their own.
+
+### Financial guards in v8
+
+A newspaper is full of numbers that are not accounting, and three of them were
+being read as financial evidence:
+
+| Signal | v7 | v8 |
+| --- | --- | --- |
+| `accounting_negative_count` | Any parenthesised number, so `(011)` and `(11)` — dialling codes in the classifieds — were negative balances. | A parenthesised number counts only with a currency symbol, inside a table, or with accounting vocabulary within a short window. Telephone patterns are excluded first; bare two-to-four digit integers (codes, footnotes, years) never count. |
+| `monthly_series` | Three month names anywhere. | Month names **and** a table, accounting vocabulary, or a real density of money. Four months across four articles is not a series. |
+| `currency_values` | Two currency matches anywhere. | Two matches **and** a density of at least 1.5 per thousand words. A financial document is dense in money; a newspaper prints a few advertised prices across thousands of words. |
+
+`news_article` does **not** block `financial_document`: a real financial
+statement still competes and still wins on its own evidence, which
+`FinancialGuardTests` asserts directly.
 
 ### Per-family operating points
 
@@ -569,6 +635,15 @@ invoice, research paper, technical report, business report, form, presentation,
 fallback, insufficient-OCR abstention, the decision contract in all three
 modes, and agreement between `config/rvl_cdip_taxonomy.json` and the
 classifier's own family list.
+
+`tests/test_news_publication.py` covers the v8 news publication family: a
+Portuguese and an English newspaper issue accepted with
+`document_subtype: newspaper_issue`, a running header standing in for a missing
+masthead, the structure features that describe the issue, Portuguese and English
+bylines on single articles, a product catalogue and a two-column journal article
+refused, and the financial guards — dialling codes not counted as accounting
+negatives, parenthesised money still counted, and a real financial statement
+still winning its own case.
 
 `tests/test_family_gates.py` covers the v6 gates. Each test encodes a failure
 the development run actually produced: visual-only evidence refused with

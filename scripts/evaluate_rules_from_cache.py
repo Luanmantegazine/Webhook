@@ -24,7 +24,9 @@ Features come from one of exactly two places, and the row says which:
 The run is refused, rather than degraded, when:
 
 * a feature record carries an unsupported schema or feature-extraction version,
-  or a fingerprint that does not match its own contents;
+  or a fingerprint that does not match its own contents — a 2.3 cache is
+  refused outright against a 2.4 classifier, because ``accounting_negative_count``
+  means something different in each;
 * a manifest ``target_family`` is outside the taxonomy;
 * a stored artifact names a rule absent from ``RULE_IDS``;
 * feature versions or fingerprints are mixed inside one evaluation;
@@ -146,6 +148,9 @@ GEOMETRY_PREDICTION_COLUMNS = [
 ]
 PREDICTION_CSV_HEADERS = [
     "sample_id", "rvl_label", "target_family", "source_target_family", "target_kind",
+    # v8: which shape of the family was matched. Empty for every family that
+    # declares no subtypes, and for every refusal.
+    "predicted_subtype",
     "rejection_label", "is_rejection_target", "in_scope_target", "target_scope_status", "source_split",
     "predicted_family", "top_candidate", "runner_up",
     "confidence", "score", "score_margin", "decision", "reason", "recognized_characters",
@@ -154,7 +159,7 @@ PREDICTION_CSV_HEADERS = [
 ] + VERSION_PREDICTION_COLUMNS + GEOMETRY_PREDICTION_COLUMNS
 REVIEW_CSV_HEADERS = [
     "sample_id", "rvl_label", "target_family", "source_target_family", "target_kind",
-    "rejection_label", "predicted_family",
+    "rejection_label", "predicted_family", "predicted_subtype",
     # v6: ``correct`` was one column answering three different questions, so a
     # rejection target that was wrongly accepted and an out-of-scope document
     # that was correctly routed both read as "False" and sorted together.
@@ -941,6 +946,11 @@ def _metrics(
 
     routing, _routing_rows = _routing_metrics(records, confidence_threshold)
     per_rvl_label, _label_rows = _per_rvl_label_metrics(records)
+    subtype_counts = Counter(
+        f"{record['predicted_family']}/{record.get('predicted_subtype') or 'none'}"
+        for record in records
+        if _is_accepted(record) and record.get("predicted_subtype")
+    )
 
     result = {
         "metric_schema_version": METRIC_SCHEMA_VERSION,
@@ -953,6 +963,14 @@ def _metrics(
         "unsafe_accept_rate": routing["unsafe_accept_rate"],
         "routing": routing,
         "per_rvl_label": per_rvl_label,
+        # A family that reports subtypes is one family with two shapes; the
+        # split is diagnostic only and never changes what counts as correct,
+        # because the ground truth is a family and not a subtype.
+        "accepted_subtype_counts": dict(sorted(subtype_counts.items())),
+        "subtype_definition": (
+            "Reported for families that declare subtypes in the taxonomy. Ground truth "
+            "is the family, so a subtype is never scored as right or wrong."
+        ),
         "classifier_eligible_sample_count": len(classifier_eligible_records),
         "rejection_target_count": len(rejection_records),
         "classification_coverage": {
@@ -1185,6 +1203,7 @@ def _predict_samples(
                 "target_scope_status": target_scope_status,
                 "source_split": sample.source_split,
                 "predicted_family": prediction["document_family"],
+                "predicted_subtype": prediction.get("document_subtype") or "",
                 "top_candidate": prediction["top_candidate"],
                 "runner_up": prediction.get("runner_up"),
                 "confidence": _coerce_float(prediction.get("confidence")),
@@ -1504,6 +1523,7 @@ def _build_ranked_review(
                 "target_kind": record["target_kind"],
                 "rejection_label": record["rejection_label"],
                 "predicted_family": record["predicted_family"],
+                "predicted_subtype": record.get("predicted_subtype") or "",
                 "canonical_correct": bool(canonical_correct),
                 "scope_correct": bool(scope_correct),
                 "is_unsafe_accept": _is_unsafe_accept(record),

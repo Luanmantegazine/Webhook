@@ -74,6 +74,9 @@ _DEFAULT_GEOMETRY_FEATURES = {
     "indent_ratio": 0.0,
     "short_line_ratio": 0.0,
     "narrative_line_ratio": 0.0,
+    "narrative_column_count": 0,
+    "newspaper_column_pages": 0,
+    "newspaper_column_geometry_ratio": 0.0,
     "centered_line_ratio": 0.0,
     "top_band_header_ratio": 0.0,
     "space_width": 0.0,
@@ -207,6 +210,52 @@ def _safe_ratio(numerator: float, denominator: float) -> float:
         return 0.0
     result = numerator / denominator
     return result if math.isfinite(result) else 0.0
+
+
+#: A newspaper column is narrower than a page and wider than a caption.
+#: Anything spanning most of the width is a headline, a masthead or a rule, and
+#: is excluded from the column estimate rather than merging every column into
+#: one band.
+_COLUMN_SPAN_LIMIT = 0.75
+_COLUMN_MIN_LINES = 4
+_COLUMN_MIN_WORDS_PER_LINE = 4
+
+
+def estimate_narrative_columns(
+    lines: list[list[Word]], page_width: float, page_height: float
+) -> int:
+    """Count narrative text columns on one page, from word positions alone.
+
+    ``two_column_ratio`` answers a yes/no question about two columns and says
+    nothing about three, four or five, which is what a newspaper front page
+    actually has. This counts them: cluster the left edge of every *body* line
+    and count the clusters that carry a column's worth of lines.
+
+    Lines that span most of the page are excluded — a banner headline crosses
+    every column and would otherwise merge them — and so are the top and bottom
+    bands, where a running header or a folio sits alone on the line.
+    """
+    if page_width <= 0 or page_height <= 0 or not lines:
+        return 0
+    tolerance = max(4.0, 0.015 * page_width)
+    starts: list[float] = []
+    for line in lines:
+        if len(line) < _COLUMN_MIN_WORDS_PER_LINE:
+            continue
+        start = line[0].x0
+        end = max(word.x1 for word in line)
+        if (end - start) >= _COLUMN_SPAN_LIMIT * page_width:
+            continue
+        centre = statistics.median([word.y_center for word in line])
+        if centre <= 0.06 * page_height or centre >= 0.96 * page_height:
+            continue
+        starts.append(start)
+
+    if len(starts) < 2 * _COLUMN_MIN_LINES:
+        return 0
+    return sum(
+        1 for cluster in _cluster(starts, tolerance) if len(cluster) >= _COLUMN_MIN_LINES
+    )
 
 
 def _page_geometry(words: list[Word], page_size: tuple[float, float]) -> dict | None:
@@ -367,6 +416,8 @@ def _page_geometry(words: list[Word], page_size: tuple[float, float]) -> dict | 
         _safe_ratio(top_band_short, len(top_band)) - _safe_ratio(body_short, len(body_band)),
     )
 
+    narrative_column_count = estimate_narrative_columns(lines, page_width, page_height)
+
     words_flat = [word for line in lines for word in line]
     uppercase = sum(
         1 for word in words_flat if len(word.text) >= 3 and word.text.isupper()
@@ -387,6 +438,7 @@ def _page_geometry(words: list[Word], page_size: tuple[float, float]) -> dict | 
         "indent_ratio": _safe_ratio(indented, len(lines)),
         "short_line_ratio": _safe_ratio(short_lines, len(lines)),
         "narrative_line_ratio": _safe_ratio(narrative_lines, len(lines)),
+        "narrative_column_count": narrative_column_count,
         "centered_line_ratio": _safe_ratio(centered, len(lines)),
         "top_band_header_ratio": round(header_excess, 4),
         "space_width": round(space_width, 2),
@@ -476,6 +528,19 @@ def extract_geometry_features(
         "indent_ratio": weighted("indent_ratio"),
         "short_line_ratio": weighted("short_line_ratio"),
         "narrative_line_ratio": weighted("narrative_line_ratio"),
+        # Column structure is a per-page fact, so it is reported as a maximum
+        # and a ratio rather than averaged: one three-column page is evidence of
+        # a three-column publication, and averaging it against a full-page
+        # advertisement would dilute it away.
+        "narrative_column_count": max(page["narrative_column_count"] for page in per_page),
+        "newspaper_column_pages": sum(
+            1 for page in per_page if page["narrative_column_count"] >= 2
+        ),
+        "newspaper_column_geometry_ratio": round(
+            sum(1 for page in per_page if page["narrative_column_count"] >= 2)
+            / len(per_page),
+            4,
+        ),
         "centered_line_ratio": weighted("centered_line_ratio"),
         "top_band_header_ratio": weighted("top_band_header_ratio"),
         "space_width": weighted("space_width"),

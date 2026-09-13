@@ -1,5 +1,5 @@
 {
-  "taxonomy_version": "rvl-cdip-2.0",
+  "taxonomy_version": "rvl-cdip-2.1",
   "source_of_truth": "tasks/document/rvl_cdip_eval.py (CLASS_TO_FAMILY); this file is the declarative copy and is verified against it by verify_config_file()",
   "supported_families": [
     "research_paper",
@@ -22,6 +22,16 @@
     "file folder"
   ],
   "rejection_criterion": "Rejection targets are not classifier families: the only correct outcome is abstained or fallback.",
+  "family_subtypes": {
+    "news_article": [
+      "newspaper_issue",
+      "single_news_article"
+    ]
+  },
+  "family_conceptual_names": {
+    "news_article": "news_publication"
+  },
+  "subtype_note": "Taxonomy 2.1 adds subtypes within a family. No label was remapped: news_article remains the public key and the RVL-CDIP class it maps from, and the subtype distinguishes a whole newspaper issue from a single clipped article.",
   "scientific_report_family": "technical_report",
   "press_release_policy": "not_news_article",
   "decisions": [

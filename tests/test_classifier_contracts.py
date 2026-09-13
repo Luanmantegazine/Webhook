@@ -86,26 +86,45 @@ def features_for(document):
 
 
 class VersionContractTests(unittest.TestCase):
-    def test_v7_identity(self):
-        self.assertTrue(CLASSIFIER_VERSION.startswith("rules-rvl-cdip-v7+"))
+    def test_v8_identity(self):
+        self.assertTrue(CLASSIFIER_VERSION.startswith("rules-rvl-cdip-v8+"))
         self.assertTrue(CLASSIFIER_VERSION.endswith(RULE_FINGERPRINT))
 
-    def test_unchanged_contract_versions(self):
-        """v7 changes no feature and no external contract, so these must not move."""
+    def test_contract_versions(self):
+        """v8 adds features and subtypes; the external record contract is unchanged.
+
+        ``SCHEMA_VERSION`` stays at 2.1 because ``document_subtype`` is optional
+        and additive — a consumer that ignores it reads the same record it read
+        before. ``FEATURE_EXTRACTION_VERSION`` moves because
+        ``accounting_negative_count`` was *redefined*, not merely joined by new
+        keys, and ``TAXONOMY_VERSION`` moves because a subtype vocabulary now
+        exists to be reported.
+        """
         self.assertEqual(SCHEMA_VERSION, "2.1")
-        self.assertEqual(TAXONOMY_VERSION, "rvl-cdip-2.0")
-        self.assertEqual(FEATURE_EXTRACTION_VERSION, "2.3")
+        self.assertEqual(TAXONOMY_VERSION, "rvl-cdip-2.1")
+        self.assertEqual(FEATURE_EXTRACTION_VERSION, "2.4")
 
-    def test_feature_fingerprint_is_unchanged(self):
+    def test_feature_record_carries_the_v8_extraction_version(self):
         features = features_for(sample_documents()[0])
-        self.assertEqual(features["feature_fingerprint"], "ff-bd13dda129e2")
-        self.assertEqual(features["feature_extraction_version"], "2.3")
+        self.assertEqual(features["feature_extraction_version"], "2.4")
+        self.assertEqual(
+            features["feature_fingerprint"], core.feature_fingerprint(features)
+        )
 
-    def test_result_reports_both_identities(self):
+    def test_result_reports_every_identity(self):
         result = classify_with_rules(features_for(sample_documents()[0]))
+        features = features_for(sample_documents()[0])
         self.assertEqual(result["classifier_version"], CLASSIFIER_VERSION)
         self.assertEqual(result["rule_fingerprint"], RULE_FINGERPRINT)
-        self.assertEqual(result["feature_fingerprint"], "ff-bd13dda129e2")
+        self.assertEqual(result["feature_fingerprint"], features["feature_fingerprint"])
+        self.assertEqual(result["feature_extraction_version"], "2.4")
+
+    def test_subtype_is_present_and_optional(self):
+        """Additive: the key is always there, ``None`` when it does not apply."""
+        for document in sample_documents():
+            result = classify_with_rules(features_for(document))
+            self.assertIn("document_subtype", result)
+            self.assertIsNone(result["document_subtype"])
 
 
 class RoutingReleaseTests(unittest.TestCase):
