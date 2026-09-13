@@ -61,7 +61,7 @@ label.
 | --- | --- |
 | `SCHEMA_VERSION` | The external contract of the feature record or the result changes. Adding a field does not move it. |
 | `TAXONOMY_VERSION` | The family set, the label mapping or the subtype vocabulary changes. Now **rvl-cdip-2.1**: subtypes exist. No label was remapped, so ground truth is unchanged. |
-| `FEATURE_EXTRACTION_VERSION` | Any derived feature's definition changes. Now **2.5**: v9 recovers editorial signals from `page_words` and *redefines* `publication_masthead_count` as a typographic candidate count, so a 2.4 cache is refused rather than pooled. |
+| `FEATURE_EXTRACTION_VERSION` | Any derived feature's definition changes. Now **2.6**: v10 *redefines* `accounting_term_count` to count only unambiguous accounting vocabulary — "ledger", "finance", "cost", "budget" and a bare "balance" move to `accounting_ambiguous_term_count` — so a 2.5 cache is refused rather than pooled. (2.5 was v9 recovering editorial signals from `page_words` and redefining `publication_masthead_count`.) |
 | `feature_fingerprint` | The emitted feature key set or the extraction version changes. Recomputable from the record itself. |
 | `CLASSIFIER_VERSION` / `rule_fingerprint` | Any rule, weight, substitutable group, channel, gate, blocker, family threshold, decision-group count, **or global operating point** (threshold, minimum margin, minimum recognised characters) changes. |
 
@@ -132,8 +132,8 @@ Example result:
 {
   "schema_version": "2.1",
   "taxonomy_version": "rvl-cdip-2.0",
-  "feature_extraction_version": "2.5",
-  "classifier_version": "rules-rvl-cdip-v9+<rule_fingerprint>",
+  "feature_extraction_version": "2.6",
+  "classifier_version": "rules-rvl-cdip-v12+<rule_fingerprint>",
   "rule_fingerprint": "<12 hex>",
   "feature_fingerprint": "ff-<12 hex>",
   "classifier": "rules",
@@ -219,8 +219,8 @@ distinction.
 | `form_structured` | **A** questionnaire heading + 1 structural signal · **B** checkboxes + 1 structural signal · **C** form heading + 2 structural signals | `field_labels`, `label_value_lines`, `tab_stop_alignment`, `field_geometry_regularity`, `short_field_regions`, `blank_fields` | invoices, specifications, news, advertisements, budgets, resumes |
 | `correspondence` | two independent signals among header block, e-mail markers, salutation, closing, memo heading, letter geometry, letter body | — | forms, news reporting |
 | `research_paper` | two of: academic structure, citations, editorial metadata, academic layout | `academic_vocabulary` | news reporting, invoices, forms |
-| `news_article` | **A** byline + reporting · **B** wire service + dateline + reporting · **C** masthead + issue metadata + editorial structure + layout + reporting · **D** running header + editorial structure + layout + reporting | `attribution_quotes`, `multilingual_reporting`, `justified_body`, `multi_column_body`, `multi_column_publication`, `newspaper_column_geometry` | scientific publications, advertisements, forms, institutional correspondence, press releases |
-| `presentation_marketing` | deck vocabulary (`presentation_terms`) **and** one visual/structural corroboration | `visual_layout`, `landscape_layout`, `visual_dominance`, `sparse_centered`, `slide_structure`, `marketing_copy` | near-empty OCR, low-confidence OCR, forms, invoices |
+| `news_article` | **A** byline + reporting · **B** wire service + dateline + reporting · **C** masthead + publication identity + editorial structure + layout + strong reporting · **C′** masthead + identity + structure + **newsprint geometry** + `issue_reporting_language` · **D** running header + structure + layout + reporting, *minus* academic evidence | `attribution_quotes`, `multilingual_reporting`, `justified_body`, `multi_column_body`, `multi_column_publication`, `newspaper_column_geometry` | scientific publications, advertisements, forms, institutional correspondence, press releases |
+| `presentation_marketing` | **A** deck vocabulary (`presentation_terms`) **and** one visual/structural corroboration · **B** a call **and** an identified event **and** one organisation signal **and** one page shape | `visual_layout`, `landscape_layout`, `visual_dominance`, `sparse_centered`, `slide_structure`, `event_logistics`, `event_organization`, `submission_instructions`, `event_announcement_layout`, `marketing_copy` | near-empty OCR, low-confidence OCR, forms, invoices; path **B** additionally: news reporting, reported speech |
 
 Consequences worth stating explicitly, because each was a measured failure:
 
@@ -363,6 +363,85 @@ to reproduce the reported detector behaviour:
 | regions only (v8) | 0 | 1 | 0 | 1 | `other` / fallback, 0.3061 |
 | with `page_words` (v9) | 2 | 1 | 1 | 1 | `news_article` / `newspaper_issue`, 1.3529 |
 
+### When the byline is unreadable rather than absent (v11)
+
+A complete New York Times front page came back as `other` by fallback. The
+page was measured correctly — a nameplate, a domain, eight headlines, eight
+article clusters, a six-column grid, 808 words, `news_article` scoring 1.0588
+before the gate — and the gate refused it on one clause: the reporting
+alternatives it accepted were a byline, a wire credit, quoted attribution or
+four reporting verbs, and the scan had none of them.
+
+That is what dense newsprint does to OCR. The small-caps `BY` above a name is
+read into the name or dropped, names fragment, the edition line and the date
+corrupt, and the quotation marks `attribution_quotes` counts come back as
+apostrophes. The markers were not absent from the page; they were absent from
+the reading of it. What survived was the body: `reporting_verb_count = 2` in
+808 words.
+
+`news_article.issue_reporting_language` is that surviving evidence — two
+reporting verbs in a page-length body — and it is weak on purpose:
+
+| | |
+| --- | --- |
+| Predicate | `reporting_verb_count >= 2` and `max(word_count, word_token_count) >= 500` |
+| Group | `reporting_evidence`, with `attribution_quotes`, `multilingual_reporting` and `justified_body` |
+| Weight | 0.16, equal to the rest of the group |
+| Admitted by | `newspaper_issue_masthead` only |
+
+Two consequences follow from the group, not from the weight. Only the
+strongest fired member of a substitutable group contributes, so a document
+that fires both this rule and `multilingual_reporting` scores exactly what it
+scored before; and because 0.16 is already the group's capacity,
+`decision_mass` (0.68) and `available_mass` (1.6) for the family are unchanged,
+so no document that already classified moves.
+
+`multilingual_reporting` keeps its four-verb floor: it is used by paths that
+have less around them. The single-article paths and
+`newspaper_issue_running_header` do not admit the new rule at all — with no
+nameplate the reporting language is doing more of the work there.
+
+**The safety argument, and where v11 put it.** v11 admitted the rule into the
+masthead path's reporting clause, arguing that five independent clauses were
+already satisfied: a nameplate, an identifying line, several headlines,
+several article clusters and a newspaper column grid. A product catalogue has
+all five — a large nameplate, a domain, headed blocks, a column grid — so two
+sentences of quoted sales copy were enough to make one a newspaper issue.
+
+### v12: the recovery reading gets its own path, and a geometry clause
+
+The weak lexical reading is now a path of its own rather than a fifth
+alternative inside the strong one:
+
+| Path | Requires | Reporting clause |
+| --- | --- | --- |
+| `newspaper_issue_masthead` | masthead + headlines + clusters, one layout signal, one identity signal | byline · wire service · attribution quotes · `multilingual_reporting` |
+| `newspaper_issue_masthead_ocr_recovery` | masthead + headlines + clusters + **`newspaper_column_geometry`** + `issue_reporting_language`, one identity signal | — it *is* the path's requirement |
+
+The difference that does the work is `newspaper_column_geometry`: measured
+narrative columns, not merely several columns on the page.
+`multi_column_publication` is deliberately not an alternative to it there,
+because a catalogue's grid satisfies that and a catalogue's page geometry does
+not read as newsprint. The strong path is untouched and still accepts an issue
+with no geometry measurement at all, as long as something journalistic is
+readable. Both paths report `newspaper_issue`, and the recovery path's
+cheapest satisfying set scores 1.2647 against 0.60.
+
+### v12: a running title is not a publication identity
+
+The other false positive entered by `newspaper_issue_running_header`: an
+academic journal article prints its title at the top of every page, which is
+what `repeated_publication_header` measures, and with columns, section
+headings and four reporting verbs it satisfied that path outright. The path
+now carries `research_publication_evidence` as its own blocker, in addition to
+the newspaper-issue blockers.
+
+The guard is deliberately on the path and not on the family. An issue may
+print citations, a science page and a book review without ceasing to be a
+newspaper — that is why the newspaper paths dropped the document-wide guards
+in v8 — but a document with no nameplate whose only identity is a repeated
+academic title was never one. The masthead paths do not carry it.
+
 ### The masthead is typographic; identity is separate
 
 v8 required editorial metadata *inside* the masthead detector, so a nameplate
@@ -432,6 +511,11 @@ rather than joining a silent backlog:
 | --- | --- | --- | --- |
 | `research_paper` / `two_independent_academic_groups` | `citations` + `two_column_layout` | 0.3188 | 0.43 |
 | `presentation_marketing` / `deck_vocabulary_with_visual_support` | `presentation_terms` + `sparse_centered` | 0.4839 | 0.60 |
+
+The path v10 adds is reachable, which is the point of checking before shipping
+it: `institutional_event_announcement`'s cheapest satisfying set is
+`event_call_to_action` + `event_identity` + `submission_instructions` +
+`event_announcement_layout`, scoring **1.0645** against the same 0.60.
 
 Both need a decision — a weight change or a threshold change — in a family this
 round was scoped away from, and neither is worth making without measurement.
@@ -572,6 +656,77 @@ being read as financial evidence:
 `news_article` does **not** block `financial_document`: a real financial
 statement still competes and still wins on its own evidence, which
 `FinancialGuardTests` asserts directly.
+
+### The institutional event announcement (v10)
+
+A real call for papers — society logos, a conference title over a date and
+venue line, a topic list, an important-dates list, submission instructions, an
+organising committee — was classified `other` by fallback. Its family had no
+path that described it, and two families were scoring on it for the wrong
+reasons:
+
+| Family | Before (v9) | Fired | After (v10) |
+| --- | --- | --- | --- |
+| `presentation_marketing` | 0.0 | — | **1.0968**, path `institutional_event_announcement` |
+| `financial_document` | 0.3878 | `accounting_vocabulary`, `monthly_series` | 0.0, neither fires |
+| `news_article` | 1.0882 | `multi_column_publication`, `publication_masthead`, `multiple_article_clusters`, `publication_date` | unchanged, and still gate-removed |
+| **decision** | `other` / fallback, 0.3878 | | `presentation_marketing` / classified |
+
+`news_article` is untouched by this change: it scored on the announcement
+before and scores the same on it now, and its gate refuses it both times with
+`missing_independent_news_evidence`. The fix was never to weaken it.
+
+**The path.** Four independent observations, because a conference is named in
+every paper published at one:
+
+| Clause | Rules | Reads |
+| --- | --- | --- |
+| required | `event_call_to_action` | The document *asks* for something: papers, abstracts, participation, proposals, registration. |
+| required | `event_identity` | A kind of gathering **and** a qualifier — a year, an ordinal, a society, an institution. Neither alone. |
+| one of | `event_logistics` · `event_organization` · `submission_instructions` | The event is organised: two distinct logistical signals, a committee, or instructions for submitting to it. One scoring group, so they cannot sum. |
+| one of | `event_announcement_layout` · `visual_layout` · `slide_structure` | The page shape — the deck's, or the typeset one-pager's. |
+
+`marketing_copy` appears in no path of this family, so advertising phrasing
+alone still cannot open a decision, and `EventPathConfigurationTests` asserts
+it.
+
+**Why a separate logo counter.** The only pictures on such a page are society
+and sponsor marks, each well under the 2% of page area that makes a picture
+"relevant" — `relevant_picture_count` is 0 on the real document. Reusing it
+would have made the layout rule unfirable, so `event_announcement_layout`
+counts small institutional blocks (0.15%–2% of the page) itself, alongside a
+high section-header density and either lists, columns or those logos.
+
+**Guards.** The announcement path carries its own blocker list rather than the
+family's, because a document may *carry* an announcement without being one: a
+newspaper with a call-for-papers advertisement in the corner of page one meets
+every requirement of the path. `reported_speech_evidence` — quoted, attributed
+sources — holds it shut, and the regression asserts that the requirements were
+met and the blocker is what stopped it. The negatives are documents that name a
+conference without announcing one: a paper published at one, a proceedings
+volume, a technical report citing one, a meeting agenda, a financial calendar,
+that newspaper, and an invoice with a registration due date.
+
+### Financial guards in v10: ambiguous words are not accounting evidence
+
+The announcement scored 0.3878 as a financial document on two rules, and both
+were reading vocabulary rather than accounting:
+
+| Signal | v9 | v10 |
+| --- | --- | --- |
+| `accounting_vocabulary` | Four or more matches of one lexicon in which "ledger", "budget", "estimate", "audit" and a bare "balance" sat beside "amount due" and "accounts payable". "Distributed ledger technology" was accounting evidence. | Three or more **distinct** terms of an *unambiguous* lexicon (balance sheet, income statement, cash flow, accounts payable/receivable, remittance, subtotal, amount due, trial balance …). The ambiguous half is counted separately as `accounting_ambiguous_term_count` and decides nothing. |
+| `monthly_series` | Three month names plus a table, accounting vocabulary or money. | The same, minus deadline months: a month within 120 characters of a submission, notification, registration or camera-ready deadline is a deadline, not a period. What remains must still sit beside a table, a density of money, or genuine period vocabulary (balance, revenue, expenses, budget, subtotal, tax, amount due). |
+
+Counting *distinct* terms matters as much as splitting the lexicon: a single
+word repeated eight times is one piece of evidence, not eight. No negative
+weight was introduced for any of this — a word that does not mean accounting is
+simply not counted as accounting, which is a different thing from subtracting
+from the case.
+
+A financial calendar (months beside revenue, balance sheet, income statement,
+budget, cash flow and tax) still fires `monthly_series`, and an invoice still
+fires `accounting_vocabulary`; both are asserted as negatives of the
+announcement path in the same module.
 
 ### Per-family operating points
 
@@ -874,6 +1029,37 @@ bylines on single articles, a product catalogue and a two-column journal article
 refused, and the financial guards — dialling codes not counted as accounting
 negatives, parenthesised money still counted, and a real financial statement
 still winning its own case.
+
+`tests/test_event_announcement.py` covers the v10 institutional event
+announcement: the real call for papers accepted as `presentation_marketing` on
+the `institutional_event_announcement` path with `news_article` still gate-
+removed and neither financial rule firing, the path's own configuration
+(`marketing_copy` in no path, a call and an identity both required), and seven
+negatives — a paper published at a conference, a proceedings volume, a
+technical report citing a conference, a meeting agenda, a financial calendar, a
+newspaper carrying a conference advertisement, and an invoice with a
+registration due date. The near misses are non-vacuous: each fires
+`event_identity`, and the newspaper meets every requirement of the path and is
+stopped by `reported_speech_evidence`.
+
+`tests/test_issue_reporting_language.py` covers v11 and v12: the real front page as a
+recorded feature record (`tests/fixtures/nyt_front_page_features.json`, whose
+`provenance` block says which keys the production run reported, which were
+declared to make the record loadable, and why the page text is not carried),
+the rule's numeric boundaries (1 verb / 800 words, 2 / 499, 2 / 500, the
+`word_token_count` reading, the four-verb floor `multilingual_reporting`
+keeps, and both readings scoring as one group contribution), the path
+restriction read off `FAMILY_GATES`, and the documents the widened clause must
+still refuse — a long reporting text with no nameplate, a technical report, a
+catalogue, a press release, an event announcement, and an academic article
+whose "reported" and "according to" fire the new rule while the gate blocks it
+on `research_publication_evidence`. v12 adds the geometry control — two
+feature vectors differing in `newspaper_column_geometry_ratio` alone, refused
+at 0.0 and accepted at 0.50 — the catalogue as an ordinary passing test rather
+than an expected failure, the strong path still opening on a byline with the
+weak rule false, the academic running-header adversarial blocked on the path
+it enters by, and a masthead-less newspaper still classifying through
+`newspaper_issue_running_header`.
 
 `tests/test_family_gates.py` covers the v6 gates. Each test encodes a failure
 the development run actually produced: visual-only evidence refused with

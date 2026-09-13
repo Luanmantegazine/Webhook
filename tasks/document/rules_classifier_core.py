@@ -113,13 +113,18 @@ SUPPORTED_FEATURE_SCHEMA_VERSIONS = frozenset({SCHEMA_VERSION})
 # reads a dialling code as a negative balance. The redefinition is why this is
 # a version bump and not an additive change: the same key now means something
 # different, so 2.3 and 2.4 records must not be pooled.
+# 2.6: ``accounting_term_count`` redefined to count only unambiguous
+# accounting vocabulary — "ledger", "finance", "cost", "budget" and a bare
+# "balance" move to ``accounting_ambiguous_term_count`` — plus distinct-term,
+# deadline-sequence, logo-picture and event-announcement counters. The
+# redefinition is why this is a bump: 2.5 records must not be pooled with 2.6.
 # 2.5: editorial signals recovered from ``page_words`` as well as from regions
 # (byline, dateline, wire service, reporting verbs, quoted attribution, issue
 # metadata, publication date and URL), combined with ``max`` and never summed;
 # and ``publication_masthead_count`` redefined as a purely *typographic*
 # candidate count, with publication identity counted separately. Both are
 # redefinitions, so 2.4 records must not be pooled with 2.5 either.
-FEATURE_EXTRACTION_VERSION = "2.5"
+FEATURE_EXTRACTION_VERSION = "2.6"
 
 #: Provisional operating point, and the single source of truth for it. The task
 #: wrapper and the offline evaluator import these instead of restating them:
@@ -245,11 +250,56 @@ _MONTH_RE = re.compile(
 # The two commercial lexicons are disjoint on purpose. Sharing tokens between
 # them made every budget-like document fire both the business and the financial
 # vocabulary rules, and the family with the larger evidence mass always won.
+#: Accounting vocabulary that means accounting *and nothing else*. A document
+#: using three distinct terms from this list is keeping books.
+_ACCOUNTING_STRONG_TERM_RE = re.compile(
+    r"\b(?:balance sheet|income statement|cash flow|financial statements?|"
+    r"accounts (?:payable|receivable)|remittance|disbursements?|subtotal|"
+    r"invoices?|expenditures?|amount due|unit price|amount payable|"
+    r"trial balance|general journal|profit and loss)\b",
+    re.IGNORECASE,
+)
+
+#: Words that are accounting in an accounting document and something else
+#: everywhere else. "Distributed ledger technology" is the case that made this
+#: split necessary: a call for papers on blockchain was the strongest
+#: accounting evidence in the corpus. "Finance", "cost", "budget", "audit" and
+#: a bare "balance" are the same kind of word — every one of them appears in
+#: research, engineering and event documents without any book being kept.
+#: Counted, reported, and never sufficient on their own.
+_ACCOUNTING_AMBIGUOUS_TERM_RE = re.compile(
+    r"\b(?:ledgers?|financ(?:e|ial|ing)|costs?|budgets?|estimates?|receipts?|"
+    r"audit(?:ed|ing)?|balances?|accounting|funds?|payments?)\b",
+    re.IGNORECASE,
+)
+
+#: The union of the two, unchanged from v9. Where the *context* already
+#: establishes accounting — a parenthesised decimal, a dense numeric grid, a
+#: reporting period beside currency — an ambiguous word is not ambiguous, and
+#: narrowing those readings was no part of this change. Keeping the lexicon
+#: verbatim keeps ``accounting_negative_count``, ``numeric_table`` and
+#: ``budget_evidence`` bit-identical to v9.
 _ACCOUNTING_TERM_RE = re.compile(
     r"\b(?:balance|balance sheet|ledger|remittance|disbursements?|subtotal|"
     r"invoices?|accounts (?:payable|receivable)|expenditures?|receipts?|"
     r"income statement|cash flow|financial statements?|audit|"
     r"budget|estimate|amount due|unit price)\b",
+    re.IGNORECASE,
+)
+
+#: A deadline sequence: a date or month next to the vocabulary of submission
+#: rather than of money. A call for papers lists five of them; reading that as
+#: a monthly financial series is how one became a ``financial_document``.
+_DEADLINE_CONTEXT_RE = re.compile(
+    r"\b(?:submissions?|abstracts?|notifications?|acceptance|camera[- ]ready|"
+    r"registrations?|deadlines?|due date|final version|proposals?)\b",
+    re.IGNORECASE,
+)
+
+#: Vocabulary that makes a run of months a *financial* period.
+_FINANCIAL_PERIOD_RE = re.compile(
+    r"\b(?:balance|revenues?|expenses?|budget|subtotal|tax|vat|amount due|"
+    r"income|cash flow|fiscal|quarter(?:ly)?|year[- ]to[- ]date)\b",
     re.IGNORECASE,
 )
 _BUSINESS_TERM_RE = re.compile(
@@ -1102,6 +1152,7 @@ def extract_classification_features(
     two_column_pages = 0
     picture_area = 0.0
     relevant_picture_count = 0
+    logo_picture_count = 0
     table_area = 0.0
     page_area_total = 0.0
     region_confidences: list[float] = []
@@ -1203,6 +1254,12 @@ def extract_classification_features(
                     picture_area += area
                     if area / page_area >= 0.02:
                         relevant_picture_count += 1
+                    elif area / page_area >= 0.0015:
+                        # Sponsor and society logos on an announcement sit well
+                        # under the 2% that makes a picture "relevant": they are
+                        # not illustrations, they are institutional marks, and
+                        # counting them as either would be wrong.
+                        logo_picture_count += 1
 
     if not text_parts:
         fallback_text = _normalise_text(document.get("full_text"))
@@ -1255,8 +1312,23 @@ def extract_classification_features(
         """The stronger of the two readings, never their sum."""
         return max(len(pattern.findall(text)), len(pattern.findall(page_word_text)))
 
-    accounting_term_count = len(_ACCOUNTING_TERM_RE.findall(text))
+    # Strong accounting vocabulary, counted both as occurrences and as
+    # *distinct* terms: a page repeating "invoice" six times is not the same
+    # evidence as one naming a balance sheet, a subtotal and accounts payable.
+    accounting_strong_terms = [
+        match.group(0).casefold() for match in _ACCOUNTING_STRONG_TERM_RE.finditer(text)
+    ]
+    accounting_term_count = len(accounting_strong_terms)
+    accounting_distinct_terms = len({" ".join(term.split()) for term in accounting_strong_terms})
     currency_matches = len(_CURRENCY_RE.findall(text))
+
+    # Months and dates that sit next to the vocabulary of submission rather
+    # than of money. A call for papers lists five; a ledger lists none.
+    deadline_sequence_count = 0
+    for match in _MONTH_RE.finditer(text):
+        window = text[max(0, match.start() - 120) : match.end() + 120]
+        if _DEADLINE_CONTEXT_RE.search(window):
+            deadline_sequence_count += 1
 
     # A running header is the same short line at the top of several pages. One
     # page cannot have one, so the ratio is only defined from two pages up.
@@ -1320,7 +1392,27 @@ def extract_classification_features(
         "currency_matches_per_1000_words": currency_matches * 1000 / max(1, len(words)),
         "numeric_token_count": len(_NUMBER_RE.findall(text)),
         "month_match_count": len(_MONTH_RE.findall(text)),
+        # Redefined in 2.6: strong terms only. "Ledger", "finance", "cost",
+        # "budget" and a bare "balance" moved to the ambiguous count below,
+        # where they are reported and never decisive.
         "accounting_term_count": accounting_term_count,
+        "accounting_distinct_term_count": accounting_distinct_terms,
+        "accounting_ambiguous_term_count": len(_ACCOUNTING_AMBIGUOUS_TERM_RE.findall(text)),
+        # v9's ``accounting_term_count`` under a name that says what it is: the
+        # reading used only where context has already settled the ambiguity.
+        "accounting_context_term_count": len(_ACCOUNTING_TERM_RE.findall(text)),
+        "deadline_sequence_count": deadline_sequence_count,
+        "financial_period_term_count": len(_FINANCIAL_PERIOD_RE.findall(text)),
+        "logo_picture_count": logo_picture_count,
+        # ---- institutional event announcement ---------------------------
+        "event_call_count": len(_EVENT_CALL_RE.findall(text)),
+        "event_kind_count": len(_EVENT_KIND_RE.findall(text)),
+        "event_qualifier_count": len(_EVENT_QUALIFIER_RE.findall(text)),
+        "event_logistics_signal_count": len(
+            {match.group(0).casefold() for match in _EVENT_LOGISTICS_RE.finditer(text)}
+        ),
+        "event_organization_count": len(_EVENT_ORGANIZATION_RE.findall(text)),
+        "submission_instruction_count": len(_SUBMISSION_INSTRUCTION_RE.findall(text)),
         # Retained under the previous name so existing consumers keep working;
         # the lexicon behind it is now disjoint from the business lexicon.
         "financial_term_count": accounting_term_count,
@@ -1541,6 +1633,71 @@ _QUESTIONNAIRE_RE = re.compile(
 # the rule's name described neither of the two things it measured. It is now
 # deck vocabulary in *heading position* plus explicit slide references; the
 # marketing half moved to its own rule, ``marketing_copy``.
+# ---- institutional event announcements ------------------------------------
+#: The call itself. An announcement asks for something: papers, abstracts,
+#: participation, registration.
+_EVENT_CALL_RE = re.compile(
+    r"\bcall\s+for\s+(?:papers?|abstracts?|participation|contributions?|"
+    r"proposals?|posters?|workshops?|tutorials?)\b"
+    r"|\bsubmit\s+your\s+(?:paper|abstract|work|contribution)\b"
+    r"|\bpapers?\s+submission\b|\bsubmission\s+of\s+papers?\b"
+    r"|\bregistration\s+(?:is\s+)?now\s+open\b"
+    r"|\bchamada\s+de\s+trabalhos\b|\bsubmiss[ãa]o\s+de\s+artigos\b",
+    re.IGNORECASE,
+)
+
+#: The event exists and is identified: a kind of gathering, plus a year, an
+#: ordinal, an acronym or an institutional name. The kind alone is not enough —
+#: every research paper says "conference" somewhere.
+_EVENT_KIND_RE = re.compile(
+    r"\b(?:conference|workshop|symposium|congress|seminar|"
+    r"confer[êe]ncia|simp[óo]sio|congresso|semin[áa]rio)\b",
+    re.IGNORECASE,
+)
+_EVENT_QUALIFIER_RE = re.compile(
+    r"\b(?:19|20)\d{2}\b"
+    r"|\b\d{1,2}(?:st|nd|rd|th)\b"
+    r"|\b[IVXLC]{1,6}\b"
+    r"|\b(?:international|national|annual|biennial|ieee|acm|ifip|springer|"
+    r"elsevier|university|institute|society|association)\b",
+    re.IGNORECASE,
+)
+
+#: Logistics. Each alternative is one signal; the rule requires two, because a
+#: single date line appears in every document ever written.
+_EVENT_LOGISTICS_RE = re.compile(
+    r"\bimportant\s+dates?\b"
+    r"|\b(?:paper|abstract|submission)\s+deadline\b"
+    r"|\bdeadline\s+for\s+(?:paper|abstract|submission|registration)\b"
+    r"|\bauthors?\s+notification\b|\bnotification\s+(?:of|to)\s+authors?\b"
+    r"|\bregistration\s+(?:deadline|due|opens?|closes?)\b"
+    r"|\bcamera[- ]ready\b"
+    r"|\bvenue\b|\bconference\s+dates?\b"
+    r"|\bdatas\s+importantes\b|\bprazo\s+de\s+submiss[ãa]o\b",
+    re.IGNORECASE,
+)
+
+#: The committee block. Institutional announcements list who is running the
+#: event; almost nothing else does.
+_EVENT_ORGANIZATION_RE = re.compile(
+    r"\b(?:organi[sz]ing|steering|technical\s+program(?:me)?|scientific)\s+committee\b"
+    r"|\b(?:general|program(?:me)?|publicity|publication|local|finance|"
+    r"workshop|tutorial)\s+(?:co[- ]?)?chairs?\b"
+    r"|\bprogram(?:me)?\s+committee\b"
+    r"|\bcomit[êe]\s+(?:organizador|de\s+programa|cient[íi]fico)\b",
+    re.IGNORECASE,
+)
+
+#: How to submit. Distinct from the call and from the dates.
+_SUBMISSION_INSTRUCTION_RE = re.compile(
+    r"\b(?:easychair|cmt|softconf|openreview|submission\s+(?:site|system|link|portal))\b"
+    r"|\b(?:manuscripts?|papers?|submissions?)\s+(?:must|should|shall)\s+(?:be|not)\b"
+    r"|\bpage\s+limit\b|\b(?:double|single)[- ]blind\b"
+    r"|\b(?:formatting|submission|author)\s+(?:guidelines|instructions)\b"
+    r"|\btemplate\s+(?:is\s+)?available\b|\bcamera[- ]ready\s+version\b",
+    re.IGNORECASE,
+)
+
 _PRESENTATION_TERM_RE = re.compile(
     r"^[ \t]*(?:agenda|overview|outline|objectives?|key takeaways?|next steps|"
     r"thank you|questions\??)[ \t]*[:.]?[ \t]*$"
@@ -1680,18 +1837,31 @@ RULES: tuple[RuleSpec, ...] = (
         group="statement_block",
     ),
     _rule("financial_document", "financial_units", lambda c: c.has(_FINANCIAL_UNITS_RE)),
-    _rule("financial_document", "accounting_vocabulary", lambda c: c.num("accounting_term_count") >= 4),
+    # Distinct terms, not occurrences: a page repeating one word six times is
+    # not keeping books, and a page naming a balance sheet, a subtotal and
+    # accounts payable is. Ambiguous vocabulary — ledger, finance, cost,
+    # budget — is counted separately and is never sufficient.
+    _rule(
+        "financial_document",
+        "accounting_vocabulary",
+        lambda c: c.num("accounting_distinct_term_count") >= 3,
+    ),
     # v8: four month names in four different articles are not a monthly series.
     # A series is a structure — a table, or months alongside the vocabulary of
     # accounting — not a count of calendar words.
+    # A run of months is a financial series only if it is *financial*. A call
+    # for papers lists five dates — submission, notification, camera-ready,
+    # registration, the event itself — and none of them is a reporting period,
+    # so months that sit next to submission vocabulary are discounted before
+    # the run is counted at all.
     _rule(
         "financial_document",
         "monthly_series",
-        lambda c: c.num("month_match_count") >= 3
+        lambda c: (c.num("month_match_count") - c.num("deadline_sequence_count")) >= 3
         and (
             c.flt("table_density") >= 0.05
-            or c.num("accounting_term_count") >= 2
             or c.flt("currency_matches_per_1000_words") >= 1.5
+            or c.num("financial_period_term_count") >= 2
         ),
     ),
     # The three former table rules collapsed into one: they tested the same
@@ -1701,7 +1871,10 @@ RULES: tuple[RuleSpec, ...] = (
         "numeric_table",
         lambda c: c.flt("table_density") >= 0.08
         and c.num("numeric_token_count") >= 8
-        and (c.num("accounting_term_count") >= 3 or c.num("currency_match_count") >= 2),
+        and (
+            c.num("accounting_context_term_count") >= 3
+            or c.num("currency_match_count") >= 2
+        ),
     ),
     _rule("financial_document", "accounting_negatives", lambda c: c.num("accounting_negative_count") >= 2),
     # ---- form / questionnaire -------------------------------------------
@@ -1827,6 +2000,61 @@ RULES: tuple[RuleSpec, ...] = (
         "presentation_terms",
         lambda c: not _tables_dominate(c) and c.has(_PRESENTATION_TERM_RE),
     ),
+    # ---- institutional event announcement -------------------------------
+    # A call for papers, a conference poster, a workshop announcement: an
+    # institution announcing an event and asking to be joined. It is neither a
+    # slide deck nor a shop advertisement, and under v9 it was nothing at all —
+    # the family it belongs to had no path that described it.
+    _rule(
+        "presentation_marketing",
+        "event_call_to_action",
+        lambda c: c.num("event_call_count") >= 1,
+    ),
+    # The event has to be identified, not merely mentioned: a kind of gathering
+    # *and* a year, an ordinal, an acronym or an institution. Every research
+    # paper says "conference" somewhere; only an announcement names one.
+    _rule(
+        "presentation_marketing",
+        "event_identity",
+        lambda c: c.num("event_kind_count") >= 1 and c.num("event_qualifier_count") >= 1,
+    ),
+    _rule(
+        "presentation_marketing",
+        "event_logistics",
+        # Two distinct signals: one date line appears in every document.
+        lambda c: c.num("event_logistics_signal_count") >= 2,
+        group="event_context",
+    ),
+    _rule(
+        "presentation_marketing",
+        "event_organization",
+        lambda c: c.num("event_organization_count") >= 1,
+        group="event_context",
+    ),
+    _rule(
+        "presentation_marketing",
+        "submission_instructions",
+        lambda c: c.num("submission_instruction_count") >= 1,
+        group="event_context",
+    ),
+    # The shape of an announcement: short, densely headed, listed, and either
+    # columned or carrying institutional logos. ``relevant_picture_count`` is
+    # deliberately not reused — the logos on such a page occupy well under the
+    # 2% of the page that makes a picture "relevant", so a rule built on it
+    # would see no visual evidence at all.
+    _rule(
+        "presentation_marketing",
+        "event_announcement_layout",
+        lambda c: c.num("total_pages") <= 4
+        and c.flt("section_header_density") >= 0.15
+        and (
+            c.flt("list_density") >= 0.10
+            or c.flt("multi_column_page_ratio") >= 0.5
+            or c.num("logo_picture_count") >= 1
+        ),
+        group="event_layout",
+        requires="layout",
+    ),
     # Primary, lexical: advertising copy. RVL-CDIP maps ``advertisement`` to
     # this family, so two independent marketing phrases are positive evidence
     # for it — and are the half of the old ``presentation_terms`` that actually
@@ -1900,6 +2128,30 @@ RULES: tuple[RuleSpec, ...] = (
         # The longer of the two readings of the page: the region stream can
         # hold a fraction of the words the OCR actually read.
         and max(c.num("word_count"), c.num("word_token_count")) >= 250,
+        group="reporting_evidence",
+    ),
+    # v11. Narrative language at the length of an *issue*, for the one case
+    # where the stronger journalistic markers are unreadable rather than
+    # absent. Dense newsprint is where OCR fails hardest: "BY" is set in small
+    # caps above the name and is read as part of it or dropped, names fragment,
+    # the edition line and the date are corrupted, and the quotation marks that
+    # ``attribution_quotes`` counts come back as apostrophes or nothing. What
+    # survives is the body: reporting verbs in a page-length text.
+    #
+    # Two verbs and 500 words is deliberately weak evidence, which is why this
+    # rule is admitted by exactly one path — ``newspaper_issue_masthead`` —
+    # where a nameplate, an identifying line, several headlines, several
+    # article clusters and a newspaper column grid have *already* been
+    # established independently. It is not admitted anywhere a document could
+    # become news on reporting language alone.
+    _rule(
+        "news_article",
+        "issue_reporting_language",
+        lambda c: c.num("reporting_verb_count") >= 2
+        # The longer of the two readings of the page, as in
+        # ``multilingual_reporting``: the region stream can hold a fraction of
+        # the words the OCR actually read.
+        and max(c.num("word_count"), c.num("word_token_count")) >= 500,
         group="reporting_evidence",
     ),
     _rule(
@@ -2069,6 +2321,15 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     "presentation_marketing.slide_structure": 0.20,
     "presentation_marketing.presentation_terms": 0.18,
     "presentation_marketing.marketing_copy": 0.22,
+    # Every new group is capped at 0.18 or below, so the family's decision mass
+    # — the three strongest group capacities — stays at 0.62 and the existing
+    # paths score exactly what they scored before.
+    "presentation_marketing.event_call_to_action": 0.18,
+    "presentation_marketing.event_identity": 0.18,
+    "presentation_marketing.event_logistics": 0.16,
+    "presentation_marketing.event_organization": 0.16,
+    "presentation_marketing.submission_instructions": 0.14,
+    "presentation_marketing.event_announcement_layout": 0.16,
     "correspondence.header_block": 0.30,
     "correspondence.salutation": 0.24,
     "correspondence.closing": 0.18,
@@ -2097,6 +2358,13 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     # readings of "this document reports" — and the group capacity, and with it
     # the family's decision mass, is unchanged.
     "news_article.multilingual_reporting": 0.16,
+    # Equal to the rest of ``reporting_evidence`` for the same reason: within a
+    # substitutable group only the strongest fired member counts, so an unequal
+    # weight would make the group capacity depend on which reading fired. At
+    # 0.16 the group capacity is unchanged, and with it ``decision_mass``,
+    # ``available_mass`` and the score of every document that already
+    # classified.
+    "news_article.issue_reporting_language": 0.16,
     "news_article.justified_body": 0.16,
     "news_article.publication_masthead": 0.20,
     "news_article.repeated_publication_header": 0.18,
@@ -2175,6 +2443,20 @@ def _news_reporting_evidence(ctx: _Context) -> bool:
     )
 
 
+def _reported_speech_evidence(ctx: _Context) -> bool:
+    """Sources quoted and attributed: someone is reporting, not announcing.
+
+    Narrower than :func:`_news_reporting_evidence`, which needs a byline, a
+    dateline or a wire credit to start — an inside page of an issue has none of
+    those, and an event advertisement printed on one would otherwise open the
+    announcement path on the whole document. An announcement states its own
+    dates and committees; it does not quote anybody about them.
+    """
+    return ctx.num("quotation_attribution_count") >= 1 or (
+        ctx.num("attribution_count") >= 3 and ctx.num("quote_mark_count") >= 2
+    )
+
+
 def _resume_evidence(ctx: _Context) -> bool:
     return ctx.has(_RESUME_HEADING_RE) or (
         ctx.has(_EXPERIENCE_SECTION_RE) and ctx.has(_EDUCATION_SECTION_RE)
@@ -2183,9 +2465,12 @@ def _resume_evidence(ctx: _Context) -> bool:
 
 def _budget_evidence(ctx: _Context) -> bool:
     """A budget is a labelled grid of money, which is form-shaped but is not a form."""
-    return (ctx.num("accounting_term_count") >= 4 and ctx.num("numeric_token_count") >= 12) or (
+    return (
+        ctx.num("accounting_context_term_count") >= 4
+        and ctx.num("numeric_token_count") >= 12
+    ) or (
         ctx.has(_REPORTING_PERIOD_RE)
-        and ctx.num("accounting_term_count") >= 3
+        and ctx.num("accounting_context_term_count") >= 3
         and ctx.num("currency_match_count") >= 2
     )
 
@@ -2312,6 +2597,11 @@ BLOCKERS: tuple[Blocker, ...] = (
         "news_reporting_evidence",
         _news_reporting_evidence,
         "Journalistic reporting: two of byline/dateline/wire, or one plus reported speech.",
+    ),
+    Blocker(
+        "reported_speech_evidence",
+        _reported_speech_evidence,
+        "Quoted and attributed sources: reporting, not announcing.",
     ),
     Blocker("resume_evidence", _resume_evidence, "CV heading, or experience and education sections."),
     Blocker("budget_evidence", _budget_evidence, "Accounting vocabulary over a dense numeric grid."),
@@ -2495,6 +2785,36 @@ _PRESENTATION_VISUAL: tuple[str, ...] = (
     "slide_structure",
 )
 
+#: An institutional event announcement — a call for papers, a congress
+#: programme, a symposium flyer — is a promotional document that does not look
+#: like a slide deck: it is dense, typeset in columns, and its "visual"
+#: evidence is a row of sponsor logos too small for ``relevant_picture_count``.
+#: Two independent observations open it, and neither is a vocabulary hit alone:
+#: the document must *call* for something (``event_call_to_action``) and must
+#: *be* an identifiable event (``event_identity`` — a kind and a qualifier).
+_EVENT_ANNOUNCEMENT_PRIMARY: tuple[str, ...] = (
+    "event_call_to_action",
+    "event_identity",
+)
+
+#: Substitutable corroboration that an event exists as an organised thing
+#: rather than as a phrase: dates and venue, a committee, or instructions for
+#: submitting to it. They share one scoring group so they cannot sum.
+_EVENT_CONTEXT: tuple[str, ...] = (
+    "event_logistics",
+    "event_organization",
+    "submission_instructions",
+)
+
+#: Substitutable page shapes an announcement can take. ``visual_layout`` and
+#: ``slide_structure`` cover the announcement that *is* a slide;
+#: ``event_announcement_layout`` covers the typeset one-pager that is not.
+_EVENT_ANNOUNCEMENT_SHAPE: tuple[str, ...] = (
+    "event_announcement_layout",
+    "visual_layout",
+    "slide_structure",
+)
+
 
 FAMILY_GATES: tuple[FamilyGate, ...] = (
     FamilyGate(
@@ -2668,6 +2988,39 @@ FAMILY_GATES: tuple[FamilyGate, ...] = (
                 ),
                 blockers=_NEWSPAPER_ISSUE_BLOCKERS,
             ),
+            # v12. The OCR-recovery reading of the same document, as its own
+            # path rather than as a fifth alternative inside the one above.
+            #
+            # v11 admitted ``issue_reporting_language`` — two reporting verbs in
+            # a page-length body — into the masthead path's reporting clause,
+            # which fixed a scanned broadsheet whose byline, dateline and
+            # quotation marks the OCR had destroyed, and admitted a product
+            # catalogue with a nameplate, a domain, a column grid and two
+            # sentences of quoted sales copy. The five clauses that were
+            # supposed to make the relaxation safe are all satisfied by a
+            # catalogue, because a catalogue genuinely has them.
+            #
+            # What a catalogue does not have is newsprint geometry. So the weak
+            # lexical reading buys nothing on its own here: this path *requires*
+            # ``newspaper_column_geometry`` — measured narrative columns, not
+            # merely several columns on the page — alongside the nameplate and
+            # an identifying line. ``multi_column_publication`` is deliberately
+            # not an alternative to it, which is the whole difference between
+            # this path and the one above.
+            GatePath(
+                name="newspaper_issue_masthead_ocr_recovery",
+                all_of=(
+                    "publication_masthead",
+                    "multiple_headlines",
+                    "multiple_article_clusters",
+                    "newspaper_column_geometry",
+                    "issue_reporting_language",
+                ),
+                any_of=(
+                    ("issue_metadata", "publication_date", "publication_url"),
+                ),
+                blockers=_NEWSPAPER_ISSUE_BLOCKERS,
+            ),
             GatePath(
                 name="newspaper_issue_running_header",
                 all_of=(
@@ -2690,7 +3043,20 @@ FAMILY_GATES: tuple[FamilyGate, ...] = (
                     # that it reports.
                     ("attribution_quotes", "multilingual_reporting"),
                 ),
-                blockers=_NEWSPAPER_ISSUE_BLOCKERS,
+                # v12: one guard the masthead paths do not carry. A running
+                # header is a weaker identity than a nameplate — it is any line
+                # repeated at the top of every page, which is exactly what a
+                # journal article's running title is — so an academic paper
+                # with columns, section headings and four reporting verbs was
+                # being promoted to a newspaper issue. The guard is written
+                # here rather than on the family because an *issue* may print
+                # citations and scientific content without being a
+                # publication; a document with no nameplate and a repeated
+                # academic title may not.
+                blockers=(
+                    *_NEWSPAPER_ISSUE_BLOCKERS,
+                    "research_publication_evidence",
+                ),
             ),
             GatePath(
                 name="byline_with_reporting",
@@ -2718,6 +3084,7 @@ FAMILY_GATES: tuple[FamilyGate, ...] = (
         corroborating=(
             "attribution_quotes",
             "multilingual_reporting",
+            "issue_reporting_language",
             "justified_body",
             "multi_column_body",
             "multi_column_publication",
@@ -2748,11 +3115,38 @@ FAMILY_GATES: tuple[FamilyGate, ...] = (
             "document-wide guards; the newspaper paths do not, because an issue "
             "contains advertisements, letters, coupons and reference lists without "
             "being any of them."
+            "\n\n"
+            "``issue_reporting_language`` — two reporting verbs in a page-length "
+            "body — reads the scanned broadsheet whose byline, dateline and "
+            "quotation marks the OCR destroyed: dense newsprint is where OCR "
+            "fails hardest, so the strongest journalistic markers can be "
+            "unreadable rather than absent. v11 admitted it into the masthead "
+            "path's reporting clause; v12 gives it a path of its own, "
+            "``newspaper_issue_masthead_ocr_recovery``, because the five clauses "
+            "around it were also satisfied by a product catalogue with a "
+            "nameplate, a domain and a column grid. The recovery path therefore "
+            "*requires* ``newspaper_column_geometry`` — measured narrative "
+            "columns rather than merely several columns — which is the one thing "
+            "a catalogue does not have; ``multi_column_publication`` is not an "
+            "alternative to it there. The original path is unchanged and still "
+            "accepts an issue on a byline, a wire credit, quoted attribution or "
+            "four reporting verbs, with no geometry required."
+            "\n\n"
+            "``newspaper_issue_running_header`` carries one guard the masthead "
+            "paths do not: ``research_publication_evidence``. A running header "
+            "is a weaker identity than a nameplate — any line repeated at the "
+            "top of every page, which is what a journal article\u2019s running "
+            "title is — so that path must refuse dominant academic evidence. The "
+            "guard is per path, not per family: an issue may print citations and "
+            "scientific content without ceasing to be a newspaper, while a "
+            "document with no nameplate and a repeated academic title was never "
+            "one."
         ),
         path_subtypes=(
             ("byline_with_reporting", "single_news_article"),
             ("wire_and_dateline_with_reporting", "single_news_article"),
             ("newspaper_issue_masthead", "newspaper_issue"),
+            ("newspaper_issue_masthead_ocr_recovery", "newspaper_issue"),
             ("newspaper_issue_running_header", "newspaper_issue"),
         ),
         metric_keys=(
@@ -2784,13 +3178,35 @@ FAMILY_GATES: tuple[FamilyGate, ...] = (
         # every false accept was visual evidence and nothing else.
         paths=(
             GatePath(
+                name="institutional_event_announcement",
+                all_of=_EVENT_ANNOUNCEMENT_PRIMARY,
+                any_of=(_EVENT_CONTEXT, _EVENT_ANNOUNCEMENT_SHAPE),
+                # The family's own guards, plus the two that separate an
+                # announcement from a document that *carries* one: a newspaper
+                # page with a call-for-papers advertisement in the corner is a
+                # newspaper, and it is the reported speech around the
+                # advertisement that says so.
+                blockers=(
+                    "presentation_text_too_sparse",
+                    "low_quality_ocr",
+                    "form_evidence",
+                    "invoice_evidence",
+                    "news_reporting_evidence",
+                    "reported_speech_evidence",
+                ),
+            ),
+            GatePath(
                 name="deck_vocabulary_with_visual_support",
                 all_of=("presentation_terms",),
                 any_of=(_PRESENTATION_VISUAL,),
             ),
         ),
-        primary=_PRESENTATION_PRIMARY,
-        corroborating=_PRESENTATION_VISUAL + ("marketing_copy",),
+        primary=_PRESENTATION_PRIMARY + _EVENT_ANNOUNCEMENT_PRIMARY,
+        corroborating=(
+            _PRESENTATION_VISUAL
+            + _EVENT_CONTEXT
+            + ("event_announcement_layout", "marketing_copy")
+        ),
         blockers=(
             "presentation_text_too_sparse",
             "low_quality_ocr",
@@ -2812,6 +3228,17 @@ FAMILY_GATES: tuple[FamilyGate, ...] = (
             "cannot open the gate: on the development set it fired once, for an "
             "invoice. A page with too little recognised text to read is refused with "
             "``insufficient_presentation_text`` — not classified for being short."
+            "\n\n"
+            "The second path reads the other promotional shape this family owns: "
+            "an institutional event announcement. It needs a call "
+            "(``event_call_to_action``), an identifiable event "
+            "(``event_identity``), one signal that the event is organised "
+            "(dates and venue, a committee, or submission instructions) and one "
+            "page shape — either a deck's or the typeset one-pager's "
+            "(``event_announcement_layout``). Four independent observations, so "
+            "neither a paper that merely names the conference it was published "
+            "at nor a proceedings volume nor a report citing a workshop can "
+            "open it; ``marketing_copy`` appears in no path at all."
         ),
     ),
 )
@@ -3326,6 +3753,30 @@ def _rule_fingerprint() -> str:
 #: rule, a weight, a gate, a blocker or a family threshold moves it.
 RULE_FINGERPRINT = _rule_fingerprint()
 
+#: v12: the OCR-recovery reading of a newspaper issue becomes its own gate
+#: path, ``newspaper_issue_masthead_ocr_recovery``, which requires measured
+#: newsprint column geometry — the one thing a product catalogue with a
+#: nameplate does not have — and ``newspaper_issue_running_header`` gains
+#: ``research_publication_evidence`` as a path blocker, because a repeated
+#: academic title is not a publication identity. No feature, weight or
+#: threshold moved.
+#:
+#: v11: ``news_article.issue_reporting_language`` — two reporting verbs in a
+#: page-length body — is admitted as the weakest reading of "this publication
+#: reports", in the ``newspaper_issue_masthead`` path only, where five
+#: independent clauses are already satisfied. It exists for the scanned
+#: broadsheet whose byline, dateline and quotation marks the OCR destroyed. No
+#: feature changed and no threshold moved.
+#:
+#: v10: ``presentation_marketing`` learns the institutional event announcement —
+#: a call for papers, a congress programme, a workshop flyer — as a second gate
+#: path built from four independent observations (a call, an identified event,
+#: the event's organisation, and the page shape), with its own guards so a
+#: document that merely *carries* an announcement does not become one. The
+#: financial lexicon is split into unambiguous and ambiguous halves in the same
+#: change: "ledger" inside "distributed ledger technology" is not accounting
+#: evidence, and a run of submission deadlines is not a monthly series.
+#:
 #: v9: editorial signals recovered from ``page_words``, a typographic masthead
 #: candidate independent of the layout detector's classes, publication identity
 #: as its own gate clause, and every declared gate path checked for
@@ -3337,7 +3788,7 @@ RULE_FINGERPRINT = _rule_fingerprint()
 #: newspaper structure and column features; and financial guards that stop a
 #: dialling code, a run of month names or a page of advertised prices from
 #: reading as accounting evidence.
-CLASSIFIER_VERSION = f"rules-rvl-cdip-v9+{RULE_FINGERPRINT}"
+CLASSIFIER_VERSION = f"rules-rvl-cdip-v12+{RULE_FINGERPRINT}"
 
 
 def available_channels(features: dict) -> frozenset[str]:

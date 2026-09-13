@@ -86,27 +86,28 @@ def features_for(document):
 
 
 class VersionContractTests(unittest.TestCase):
-    def test_v9_identity(self):
-        self.assertTrue(CLASSIFIER_VERSION.startswith("rules-rvl-cdip-v9+"))
+    def test_v12_identity(self):
+        self.assertTrue(CLASSIFIER_VERSION.startswith("rules-rvl-cdip-v12+"))
         self.assertTrue(CLASSIFIER_VERSION.endswith(RULE_FINGERPRINT))
 
     def test_contract_versions(self):
-        """v8 adds features and subtypes; the external record contract is unchanged.
+        """v10 adds rules, features and a gate path; the record contract holds.
 
-        ``SCHEMA_VERSION`` stays at 2.1 because ``document_subtype`` is optional
-        and additive — a consumer that ignores it reads the same record it read
-        before. ``FEATURE_EXTRACTION_VERSION`` moves because
-        ``accounting_negative_count`` was *redefined*, not merely joined by new
-        keys, and ``TAXONOMY_VERSION`` moves because a subtype vocabulary now
-        exists to be reported.
+        ``SCHEMA_VERSION`` stays at 2.1: every key v10 adds is additive, and a
+        consumer that ignores them reads the record it read before.
+        ``TAXONOMY_VERSION`` stays at 2.1 because no family, subtype or
+        conceptual name changed. ``FEATURE_EXTRACTION_VERSION`` moves because
+        ``accounting_term_count`` was *redefined* — the ambiguous half of the
+        accounting lexicon now counts separately — so 2.5 and 2.6 records must
+        not be pooled.
         """
         self.assertEqual(SCHEMA_VERSION, "2.1")
         self.assertEqual(TAXONOMY_VERSION, "rvl-cdip-2.1")
-        self.assertEqual(FEATURE_EXTRACTION_VERSION, "2.5")
+        self.assertEqual(FEATURE_EXTRACTION_VERSION, "2.6")
 
     def test_feature_record_carries_the_current_extraction_version(self):
         features = features_for(sample_documents()[0])
-        self.assertEqual(features["feature_extraction_version"], "2.5")
+        self.assertEqual(features["feature_extraction_version"], "2.6")
         self.assertEqual(
             features["feature_fingerprint"], core.feature_fingerprint(features)
         )
@@ -117,7 +118,7 @@ class VersionContractTests(unittest.TestCase):
         self.assertEqual(result["classifier_version"], CLASSIFIER_VERSION)
         self.assertEqual(result["rule_fingerprint"], RULE_FINGERPRINT)
         self.assertEqual(result["feature_fingerprint"], features["feature_fingerprint"])
-        self.assertEqual(result["feature_extraction_version"], "2.5")
+        self.assertEqual(result["feature_extraction_version"], "2.6")
 
     def test_subtype_is_present_and_optional(self):
         """Additive: the key is always there, ``None`` when it does not apply."""
