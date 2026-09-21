@@ -1,0 +1,9 @@
+# Extra dependencies for the embedding baseline classifier
+# (tasks/document/embedding_classifier_core.py and scripts/*embedding*).
+#
+# Deliberately a separate file: the rules classifier, its tests and the whole
+# unit suite run without any of this. Only building a reference index,
+# calibrating, or evaluating with real weights needs it.
+sentence-transformers~=3.0
+torch~=2.3
+numpy~=1.26

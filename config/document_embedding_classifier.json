@@ -1,0 +1,34 @@
+{
+  "_comment": [
+    "Configuration of the embedding baseline classifier. The taxonomy is NOT",
+    "declared here: tasks/document/rvl_cdip_eval.py is its single source, and a",
+    "second copy is a second thing to change.",
+    "Thresholds default to 0.0 and calibration_status to 'uncalibrated', which",
+    "is what an uncalibrated run is. Replace them with the artifact produced by",
+    "scripts/calibrate_embedding_thresholds.py, which is computed on a",
+    "development split disjoint from the benchmark."
+  ],
+  "model": {
+    "name": "intfloat/multilingual-e5-base",
+    "revision": null,
+    "text_prefix": "query: ",
+    "max_tokens": 384,
+    "overlap_tokens": 64,
+    "pooling": "normalized_chunk_mean",
+    "device_order": ["cuda", "mps", "cpu"]
+  },
+  "decision": {
+    "similarity_threshold": 0.0,
+    "min_score_margin": 0.0,
+    "min_recognized_characters": 20,
+    "family_similarity_thresholds": {},
+    "family_min_score_margins": {},
+    "calibration_status": "uncalibrated",
+    "calibration_note": "Defaults ship uncalibrated: no development split has been run against this index."
+  },
+  "reference": {
+    "index_directory": "output/embedding_reference",
+    "minimum_examples_per_label": 5,
+    "recommended_examples_per_label": 20
+  }
+}
